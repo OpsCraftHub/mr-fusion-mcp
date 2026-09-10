@@ -16,7 +16,11 @@ from mcp.server.fastmcp import FastMCP
 
 from auth import make_auth_headers_fn
 
-BOARD_URL = os.getenv("BOARD_URL", "https://mr-fusion.opscraft.cc/api/board")
+# Board-go serves at /api/board-go behind the frontend nginx proxy
+# (which rewrites to /api/v1 internally). The old Python `/api/board`
+# service is scaled to 0; keeping that as a default would silently
+# break every tool invocation.
+BOARD_URL = os.getenv("BOARD_URL", "https://mr-fusion.opscraft.cc/api/board-go")
 
 mcp = FastMCP("dispatch")
 
@@ -909,14 +913,16 @@ async def reject_draft(task_id: str, feedback: str) -> str:
 
 
 @mcp.tool()
-async def approve_drafts(project_id: str, task_ids: list[str]) -> str:
+async def approve_drafts(task_ids: list[str]) -> str:
     """Bulk approve draft packets — moves them from draft to triage.
 
+    project_id is inferred by board-go from the task rows (drafts scope
+    to the caller's org via JWT), so no project id is needed.
+
     Args:
-        project_id: UUID of the project
         task_ids: List of task UUIDs to approve
     """
-    data = await _post(f"/projects/{project_id}/bulk-approve", {"task_ids": task_ids})
+    await _post("/tasks/approve-drafts", {"task_ids": task_ids})
     return f"Approved {len(task_ids)} drafts"
 
 
@@ -1228,76 +1234,53 @@ async def list_suggestions(project_id: str) -> str:
 
 
 # ── AI Runner Trigger Tools ──────────────────────────────────
+#
+# Board-go emits webhook events per task/op/project mutation which
+# AI Runner routes to the appropriate pipeline. The MCP tools below
+# fire those events by hitting the relevant board-go endpoint —
+# there's no direct /ai-trigger dispatcher (that was Python-era).
 
 
 @mcp.tool()
-async def trigger_reclassify(project_id: str, task_id: str) -> str:
+async def trigger_reclassify(task_id: str) -> str:
     """Re-trigger AI classification on a task — re-assigns it to the correct Op.
 
-    Use when AI classified a ticket into the wrong Op, or when
-    the task title/description has changed significantly.
+    Use when AI classified a ticket into the wrong Op, or when the
+    task title/description has changed significantly. Task must be in
+    triage — board-go's trigger-classify only runs on that column.
 
     Args:
-        project_id: UUID of the project
         task_id: UUID of the task to reclassify
     """
-    data = await _post(f"/projects/{project_id}/ai-trigger", {
-        "action": "reclassify",
-        "task_id": task_id,
-    })
+    await _post(f"/tasks/{task_id}/trigger-classify", {})
     return f"Triggered reclassify for task {task_id}"
 
 
 @mcp.tool()
-async def trigger_regroom(project_id: str, task_id: str) -> str:
+async def trigger_regroom(task_id: str) -> str:
     """Re-trigger AI grooming on a task — regenerates description, criteria, estimate.
 
-    Use when requirements have changed and the AI-generated grooming is stale,
-    or when the initial groom wasn't good enough.
+    Use when requirements have changed and the AI-generated grooming
+    is stale. Task must be in triage.
 
     Args:
-        project_id: UUID of the project
         task_id: UUID of the task to re-groom
     """
-    data = await _post(f"/projects/{project_id}/ai-trigger", {
-        "action": "regroom",
-        "task_id": task_id,
-    })
+    await _post(f"/tasks/{task_id}/trigger-groom", {})
     return f"Triggered regroom for task {task_id}"
 
 
-@mcp.tool()
-async def trigger_reenrich(project_id: str, op_id: str) -> str:
-    """Re-trigger AI enrichment on an Op — re-maps it to relevant code files and dirs.
-
-    Use when repos have been updated or when the Op's code mapping is wrong.
-
-    Args:
-        project_id: UUID of the project
-        op_id: UUID of the Op to re-enrich
-    """
-    data = await _post(f"/projects/{project_id}/ai-trigger", {
-        "action": "reenrich",
-        "op_id": op_id,
-    })
-    return f"Triggered reenrich for Op {op_id}"
-
-
-@mcp.tool()
-async def trigger_rebootstrap(project_id: str) -> str:
-    """Re-trigger AI workspace bootstrap — re-scans repos and regenerates CLAUDE.md + SYSTEM_SPEC.md.
-
-    Use when repos have been added or removed from the Launch Pad,
-    or when the workspace context is stale. The system spec is the primary
-    architecture doc used by groom, classify, and implement pipelines.
-
-    Args:
-        project_id: UUID of the project
-    """
-    data = await _post(f"/projects/{project_id}/ai-trigger", {
-        "action": "rebootstrap",
-    })
-    return f"Triggered rebootstrap for project {project_id}"
+# trigger_reenrich + trigger_rebootstrap removed 2026-09-10. Board-go
+# only wires webhook Push on task-level triggers today (see
+# services/board-go/internal/api/task_triggers.go) — project/op PUT
+# handlers fan out via SSE but never hit AI Runner's webhook. Adding
+# these back requires wh.Push calls in updateProjectHandler +
+# updateSubProjectHandler with event="project.updated" /
+# event="op.updated". Follow-up ticket in Board Service backlog.
+#
+# For now, the sync_workspace_to_lp tool's bootstrap-trigger flag
+# still works because syncing repos hits PUT /projects/:id which will
+# start emitting a webhook event once the follow-up ships.
 
 
 # ── Workflow Intelligence Tools ──────────────────────────────
@@ -1909,9 +1892,10 @@ async def sync_workspace_to_lp(
     bootstrap_msg = ""
     if trigger_bootstrap:
         try:
-            await _post(f"/projects/{project_id}/ai-trigger", {
-                "action": "rebootstrap",
-            })
+            # AI Runner picks up project.updated events and routes them
+            # to REBOOTSTRAP. The PUT above already updated the project
+            # with the new repos list, which fires project.updated —
+            # no separate trigger call needed.
             bootstrap_msg = "\nTriggered AI bootstrap — CLAUDE.md + SYSTEM_SPEC.md will be generated shortly."
         except Exception as e:
             bootstrap_msg = f"\nBootstrap trigger failed: {e}. You can trigger manually later."
