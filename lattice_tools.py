@@ -75,12 +75,24 @@ def register_lattice_tools(mcp, auth_headers_fn):
         entity_id: str = "",
         is_context: bool = False,
     ) -> str:
-        """Create a Lattice document (note, spec, guide, etc). Optionally link to a Board entity.
+        """Create a Lattice document (markdown body). Optionally link to a Board entity.
 
         Args:
             title: Document title
             content: Markdown content
-            doc_type: Type — note, post, spec, guide (default: note)
+            doc_type: Type — one of the registered doc types. Current registry:
+                - note      — free-form note (default)
+                - diagram   — Excalidraw diagram (use create_diagram instead)
+                - adr       — Architecture Decision Record
+                - spec      — technical specification
+                - guide     — how-to guide
+                - runbook   — operational procedure
+                - glossary  — domain terms / entities
+                - context   — sprint container context bundle
+                - meeting   — meeting notes / decisions / actions
+                - post      — blog / publication content (Emitter)
+                Unknown values return 422 (invalid_doc_type). Registry is queryable
+                via GET /api/v1/doc-types on the Lattice service.
             entity_type: Optional — link to op, task, or project
             entity_id: Optional — UUID of the entity to link to
             is_context: If true, Claude should auto-read this doc when working on the entity
@@ -103,6 +115,66 @@ def register_lattice_tools(mcp, auth_headers_fn):
             result += f"\nLinked to {entity_type}/{entity_id}{ctx}"
 
         return result
+
+    @mcp.tool()
+    async def create_diagram(
+        title: str,
+        scene: dict,
+        entity_type: str = "",
+        entity_id: str = "",
+        is_context: bool = False,
+    ) -> str:
+        """Create a Lattice diagram (Excalidraw scene). Optionally link to a Board entity.
+
+        Server auto-sets doc_type='diagram' when content_format='excalidraw' and
+        no explicit doc_type is provided, so the chip on the UI reads "Diagram".
+
+        Args:
+            title: Document title
+            scene: Excalidraw scene object — {type, version, source, elements, appState, files}.
+                   Elements is a list of Excalidraw shape/text/arrow dicts. Colours should be
+                   light-mode values (Excalidraw inverts them under theme="dark").
+            entity_type: Optional — link to op, task, or project
+            entity_id: Optional — UUID of the entity to link to
+            is_context: If true, agents should auto-read this diagram when working on the entity
+        """
+        headers = await auth_headers_fn()
+        body = {
+            "title": title,
+            "content": "",
+            "content_format": "excalidraw",
+            "content_json": scene,
+        }
+        doc = await _lattice_post("/admin/posts", headers, body)
+
+        result = f"Created diagram: {doc['title']} (id: {doc['id']}, doc_type: {doc.get('doc_type')})"
+
+        if entity_type and entity_id:
+            link_body = {
+                "document_id": doc["id"],
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "is_context": is_context,
+            }
+            await _lattice_post("/admin/links", headers, link_body)
+            ctx = " (context)" if is_context else ""
+            result += f"\nLinked to {entity_type}/{entity_id}{ctx}"
+
+        return result
+
+    @mcp.tool()
+    async def list_doc_types() -> str:
+        """List the registered Lattice doc types with their labels and descriptions.
+
+        Useful when you need to know which doc_type to pass to create_document,
+        or to check whether a type you want to use is registered.
+        """
+        headers = await auth_headers_fn()
+        data = await _lattice_get("/doc-types", headers)
+        lines = [f"Default: {data.get('default', 'note')}", "Registered types:"]
+        for entry in data.get("types", []):
+            lines.append(f"  - {entry['name']:10s} {entry['label']:12s} — {entry['description']}")
+        return "\n".join(lines)
 
     @mcp.tool()
     async def read_document(document_id: str) -> str:
