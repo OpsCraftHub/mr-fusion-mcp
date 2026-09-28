@@ -1926,9 +1926,11 @@ async def sync_workspace_to_lp(
 
 from lattice_tools import register_lattice_tools
 from chrono_tools import register_chrono_tools
+from rag_tools import register_rag_tools
 
 register_lattice_tools(mcp, _auth_headers)
 register_chrono_tools(mcp, _auth_headers)
+register_rag_tools(mcp, _auth_headers)
 
 
 if __name__ == "__main__":
