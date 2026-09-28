@@ -174,6 +174,10 @@ async def list_tasks(
     assignee: str = "",
     op_id: str = "",
     limit: int = 50,
+    created_after: str = "",
+    created_before: str = "",
+    completed_after: str = "",
+    completed_before: str = "",
 ) -> str:
     """List packets (tasks) in a project with optional filters.
 
@@ -183,6 +187,10 @@ async def list_tasks(
         assignee: Filter by assignee user ID
         op_id: Filter by Op (sub-project) ID
         limit: Max results (default 50)
+        created_after: Only tasks created at or after this date (YYYY-MM-DD or RFC3339). SAST-anchored.
+        created_before: Only tasks created strictly before this date. SAST-anchored.
+        completed_after: Only tasks completed (done) at or after this date.
+        completed_before: Only tasks completed strictly before this date.
     """
     params: dict[str, Any] = {"limit": limit}
     if status:
@@ -191,6 +199,14 @@ async def list_tasks(
         params["assignee"] = assignee
     if op_id:
         params["sub_project_id"] = op_id
+    for key, val in (
+        ("created_after", created_after),
+        ("created_before", created_before),
+        ("completed_after", completed_after),
+        ("completed_before", completed_before),
+    ):
+        if val:
+            params[key] = val
     data = await _get(f"/projects/{project_id}/tasks", params)
     tasks = data.get("items", data) if isinstance(data, dict) else data
     lines = []
@@ -206,6 +222,65 @@ async def list_tasks(
             f"(priority: {t['priority']}, id: {t['id']})"
         )
     return "\n".join(lines) if lines else "No packets found."
+
+
+@mcp.tool()
+async def get_throughput_stats(
+    metric: str = "both",
+    range: str = "week",
+    from_date: str = "",
+    to_date: str = "",
+    project_id: str = "",
+    op_id: str = "",
+) -> str:
+    """Answer 'how many tickets came in / shipped in period X?' with a
+    by-day breakdown. Use this when asked about intake volume, tickets
+    created/completed today, this week, this month, or a custom window.
+
+    Args:
+        metric: created | completed | both (default both)
+        range: Preset window — day (today), week (WTD), month (MTD),
+               prev_week, prev_month. Ignored if from_date/to_date given.
+        from_date: Explicit window start, YYYY-MM-DD (SAST midnight) or RFC3339.
+                   Requires to_date.
+        to_date: Explicit window end, exclusive. Requires from_date.
+        project_id: Scope to one project (UUID). Omit for the whole org.
+        op_id: Scope to one Op / sub-project (UUID).
+    """
+    params: dict[str, Any] = {"metric": metric}
+    if from_date or to_date:
+        # Backend enforces "both or neither" — pass through as-is so the
+        # user sees the backend's own 400 message if they mis-supply.
+        if from_date:
+            params["from"] = from_date
+        if to_date:
+            params["to"] = to_date
+    else:
+        params["range"] = range
+    if project_id:
+        params["project_id"] = project_id
+    if op_id:
+        params["sub_project_id"] = op_id
+
+    data = await _get("/tasks/throughput-stats", params)
+
+    rng = data.get("range", {})
+    lines = [
+        f"Throughput — {rng.get('preset', '?')} ({rng.get('from', '?')} → {rng.get('to', '?')})",
+    ]
+
+    def _render_series(label: str, series: dict[str, Any]) -> None:
+        lines.append(f"\n{label}: {series.get('total', 0)}")
+        for bucket in series.get("by_day", []):
+            marker = "▓" * min(int(bucket.get("count", 0)), 20)
+            lines.append(f"  {bucket['date']}  {bucket['count']:>3}  {marker}")
+
+    if data.get("created"):
+        _render_series("Created", data["created"])
+    if data.get("completed"):
+        _render_series("Completed", data["completed"])
+
+    return "\n".join(lines)
 
 
 @mcp.tool()
