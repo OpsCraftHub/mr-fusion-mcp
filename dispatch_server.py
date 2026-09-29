@@ -2002,10 +2002,20 @@ async def sync_workspace_to_lp(
 from lattice_tools import register_lattice_tools
 from chrono_tools import register_chrono_tools
 from rag_tools import register_rag_tools
+from workspace_tools import register_workspace_tools
+from symbol_tools import register_symbol_tools
+from auth import make_org_id_fn
+
+# workspace + symbol tools need the caller's org_id from the JWT
+# (path-scoped endpoints). Reuse the same auth flow via a lazy JWT
+# decoder — no extra Keycloak call.
+_org_id = make_org_id_fn(_auth_headers)
 
 register_lattice_tools(mcp, _auth_headers)
 register_chrono_tools(mcp, _auth_headers)
 register_rag_tools(mcp, _auth_headers)
+register_workspace_tools(mcp, _auth_headers, _org_id)
+register_symbol_tools(mcp, _auth_headers, _org_id)
 
 
 if __name__ == "__main__":

@@ -2,9 +2,18 @@
 
 import os
 import time
+import warnings
 from typing import Any, Callable, Coroutine
 
 import httpx
+
+# FastMCP's Settings model has a `lifespan` field whose annotation contains an
+# unresolved forward reference; pydantic_settings >= 2.6 warns on import. The
+# warning is harmless but pollutes stderr and can confuse MCP clients.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Field 'lifespan' has an incomplete definition.*",
+)
 
 _token_caches: dict[str, dict[str, Any]] = {}
 
@@ -59,3 +68,51 @@ def make_auth_headers_fn(
         return {"Authorization": f"Bearer {token}"} if token else {}
 
     return _auth_headers
+
+
+def make_org_id_fn(
+    auth_headers_fn: Callable[[], Coroutine[Any, Any, dict[str, str]]],
+) -> Callable[[], Coroutine[Any, Any, str]]:
+    """Return an async org_id() function that decodes the KC JWT
+    (without signature verification — ai-runner verifies server-side)
+    and returns the `org_id` claim.
+
+    Used by workspace + symbol tools where the endpoint URL is scoped
+    by org — /workspace/orgs/{org_id}/lps/{lp}/... — so the tool needs
+    to resolve the caller's org before making the call.
+
+    Uses stdlib b64 + json (no PyJWT dep). Result cached per token so
+    typical use doesn't decode on every call.
+    """
+    import base64
+    import json as _json
+
+    async def _org_id() -> str:
+        headers = await auth_headers_fn()
+        bearer = headers.get("Authorization", "")
+        if not bearer.startswith("Bearer "):
+            raise RuntimeError(
+                "no Bearer token available — set KEYCLOAK_USERNAME / "
+                "KEYCLOAK_PASSWORD or the fallback static token env var"
+            )
+        token = bearer[len("Bearer "):]
+        # JWT = header.payload.signature — decode the middle segment.
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise RuntimeError("bearer isn't a JWT (expected 3 dot-segments)")
+        # base64url pad. Python's b64decode is strict about padding.
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        try:
+            payload = _json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception as e:
+            raise RuntimeError(f"couldn't decode JWT payload: {e}") from e
+        org_id = payload.get("org_id") or payload.get("organization_id")
+        if not org_id:
+            raise RuntimeError(
+                "JWT has no org_id claim — token belongs to a user with "
+                "no active org, or Keycloak isn't mapping the org claim "
+                "onto this client's tokens"
+            )
+        return str(org_id)
+
+    return _org_id
