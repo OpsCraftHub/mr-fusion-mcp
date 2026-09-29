@@ -1999,6 +1999,78 @@ async def sync_workspace_to_lp(
     return "\n".join(lines)
 
 
+# ── LP + Op consolidation tools ────────────────────────────────
+
+@mcp.tool()
+async def consolidate_lp(source_lp: str, target_lp: str) -> str:
+    """Merge a source LP into a target LP. Source's Ops + tasks flow
+    into target; source LP is deleted. Target's permissions, members,
+    and repos stay authoritative — source is a content donor, not a
+    peer.
+
+    Op name collisions get renamed to '{name} ({source_lp_name})' so
+    nothing silently merges. Cross-service state (Lattice entity_links,
+    RAG chunks, symbol_defs) is NOT touched — re-register repos +
+    re-bless docs against the target LP after this.
+
+    Requires owner role on BOTH LPs.
+
+    Args:
+        source_lp: UUID of the LP to merge from (will be deleted).
+        target_lp: UUID of the LP to merge into (survives).
+    """
+    if source_lp == target_lp:
+        raise Exception("consolidate_lp: source and target must differ")
+    headers = await _auth_headers()
+    async with httpx.AsyncClient() as c:
+        r = await c.post(
+            f"{BOARD_URL}/projects/{source_lp}/consolidate-into/{target_lp}",
+            headers=headers, timeout=60,
+        )
+    if r.status_code == 403:
+        raise Exception("consolidate_lp: forbidden — owner role needed on both LPs")
+    if r.status_code == 404:
+        raise Exception(f"consolidate_lp: not found — {r.text[:200]}")
+    if r.status_code == 422:
+        raise Exception(f"consolidate_lp: invalid — {r.text[:200]}")
+    if not r.is_success:
+        raise Exception(f"consolidate_lp HTTP {r.status_code}: {r.text[:200]}")
+    return json.dumps(r.json(), indent=2)
+
+
+@mcp.tool()
+async def consolidate_op(source_op: str, target_op: str) -> str:
+    """Merge a source Op into a target Op within the same LP. Source's
+    tasks flow into target; source Op is deleted.
+
+    Both Ops MUST belong to the same LP (otherwise this would secretly
+    move tasks across LPs — use consolidate_lp for that instead).
+
+    Requires owner role on the parent LP.
+
+    Args:
+        source_op: UUID of the Op to merge from (will be deleted).
+        target_op: UUID of the Op to merge into (survives).
+    """
+    if source_op == target_op:
+        raise Exception("consolidate_op: source and target must differ")
+    headers = await _auth_headers()
+    async with httpx.AsyncClient() as c:
+        r = await c.post(
+            f"{BOARD_URL}/sub-projects/{source_op}/consolidate-into/{target_op}",
+            headers=headers, timeout=60,
+        )
+    if r.status_code == 403:
+        raise Exception("consolidate_op: forbidden — owner role on parent LP required")
+    if r.status_code == 404:
+        raise Exception(f"consolidate_op: not found — {r.text[:200]}")
+    if r.status_code == 422:
+        raise Exception(f"consolidate_op: invalid — {r.text[:200]}")
+    if not r.is_success:
+        raise Exception(f"consolidate_op HTTP {r.status_code}: {r.text[:200]}")
+    return json.dumps(r.json(), indent=2)
+
+
 from lattice_tools import register_lattice_tools
 from chrono_tools import register_chrono_tools
 from rag_tools import register_rag_tools
