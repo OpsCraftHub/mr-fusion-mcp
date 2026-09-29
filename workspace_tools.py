@@ -191,6 +191,45 @@ def register_workspace_tools(mcp, auth_headers_fn, org_id_fn):
         return _fmt(r.json())
 
     @mcp.tool()
+    async def trigger_doc_backfill() -> str:
+        """Kick off a bulk re-ingest of every Lattice document in the
+        caller's org into the RAG. Same button as Settings → Organization
+        → AI Config → 'Ingest all Lattice documents', callable from
+        Claude Code so the setup flow can happen entirely from your
+        terminal.
+
+        Returns immediately with a job snapshot; poll doc_backfill_status
+        to watch progress. 202 on accept, 409 if one is already running,
+        412 if BYOK embeddings keys aren't configured.
+
+        Requires owner/admin role on the org.
+        """
+        org_id = await org_id_fn()
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{AI_RUNNER_URL}/rag/backfill/{org_id}/documents",
+                headers=await auth_headers_fn(), timeout=30,
+            )
+        _raise_for(r, "trigger_doc_backfill")
+        return _fmt(r.json())
+
+    @mcp.tool()
+    async def doc_backfill_status() -> str:
+        """Read the latest state of the Lattice doc backfill for the
+        caller's org. Non-blocking — returns immediately with counts
+        and status (running / completed / failed / cancelled). 404 if
+        no backfill has been kicked off on this pod.
+        """
+        org_id = await org_id_fn()
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{AI_RUNNER_URL}/rag/backfill/{org_id}/documents/status",
+                headers=await auth_headers_fn(), timeout=15,
+            )
+        _raise_for(r, "doc_backfill_status")
+        return _fmt(r.json())
+
+    @mcp.tool()
     async def workspace_reindex_symbols(lp_id: str, repo_name: str) -> str:
         """Rebuild the tree-sitter symbol_defs index for this repo from
         the current working tree. Wipes + re-inserts atomically.

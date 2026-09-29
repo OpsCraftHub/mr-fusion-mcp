@@ -47,6 +47,19 @@ async def _lattice_put(path: str, auth_headers: dict, body: dict | None = None) 
         return r.json()
 
 
+async def _lattice_patch(path: str, auth_headers: dict, body: dict | None = None) -> Any:
+    headers = {"Content-Type": "application/json", **auth_headers}
+    async with httpx.AsyncClient() as c:
+        r = await c.patch(f"{LATTICE_URL}{path}", json=body or {}, headers=headers, timeout=30)
+        if not r.is_success:
+            try:
+                detail = r.json()
+            except Exception:
+                detail = r.text[:200]
+            raise Exception(f"Lattice {r.status_code}: {detail}")
+        return r.json()
+
+
 async def _lattice_delete(path: str, auth_headers: dict) -> str:
     async with httpx.AsyncClient() as c:
         r = await c.delete(f"{LATTICE_URL}{path}", headers=auth_headers, timeout=30)
@@ -404,6 +417,115 @@ def register_lattice_tools(mcp, auth_headers_fn):
         headers = await auth_headers_fn()
         await _lattice_delete(f"/admin/folders/{folder_id}", headers)
         return f"Deleted folder {folder_id}"
+
+    @mcp.tool()
+    async def list_documents(
+        status: str = "",
+        doc_type: str = "",
+        folder_id: str = "",
+        search: str = "",
+        limit: int = 50,
+    ) -> str:
+        """Browse documents in the org — filters by status / type / folder /
+        title search. Use before deciding what to mark as AI context or
+        what to link to an LP.
+
+        Args:
+            status: draft | published (default: all)
+            doc_type: e.g. 'note', 'spec' (default: all)
+            folder_id: UUID of a folder to filter to
+            search: case-insensitive title substring match
+            limit: max results (default 50)
+        """
+        headers = await auth_headers_fn()
+        params: dict[str, Any] = {"limit": max(1, min(limit, 200))}
+        if status:
+            params["status"] = status
+        if doc_type:
+            params["doc_type"] = doc_type
+        if folder_id:
+            params["folder_id"] = folder_id
+        if search:
+            params["search"] = search
+        docs = await _lattice_get("/admin/posts", headers, params)
+        if not docs:
+            return "No documents match."
+        lines = [f"{len(docs)} document(s):"]
+        for d in docs:
+            lines.append(
+                f"  - [{d.get('doc_type', '?')}·{d.get('status', '?')}] "
+                f"{d.get('title', '(untitled)')} — id {d.get('id')}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def set_document_context(
+        document_id: str,
+        entity_type: str,
+        entity_id: str,
+        is_context: bool,
+    ) -> str:
+        """Toggle a doc's AI-context flag for a specific LP or Op —
+        the equivalent of clicking ★ in Lattice's link panel per doc.
+
+        If the doc isn't linked to the entity yet, creates the link with
+        the given is_context state. If already linked, PATCHes the
+        existing link's is_context flag.
+
+        Blessed context (is_context=True) is what RAG treats as trusted
+        for that LP — see ADR-0002. Discoverable-only docs (is_context=
+        False) still appear in `find_symbol`-style discovery searches
+        but are excluded from prompt-injection paths.
+
+        Args:
+            document_id: UUID of the doc.
+            entity_type: 'project' (LP) or 'op' (sub-project). Task-level
+                context isn't exposed — LP/Op are the trust scopes.
+            entity_id: UUID of the LP or Op.
+            is_context: True to bless, False to demote to discoverable.
+        """
+        if entity_type not in ("project", "op"):
+            raise Exception("entity_type must be 'project' or 'op'")
+        headers = await auth_headers_fn()
+        # Fetch existing links for this entity; find the one for this doc.
+        data = await _lattice_get(
+            f"/links/by-entity/{entity_type}/{entity_id}", headers,
+        )
+        existing = next(
+            (d for d in data.get("documents", [])
+             if str(d.get("id")) == document_id),
+            None,
+        )
+        # The by-entity endpoint returns docs, not link ids — walk /admin/links
+        # to find the specific link row so we can PATCH it.
+        links_res = await _lattice_get(
+            f"/admin/links", headers,
+            params={"document_id": document_id},
+        )
+        link = next(
+            (l for l in links_res
+             if l.get("entity_type") == entity_type
+             and str(l.get("entity_id")) == entity_id),
+            None,
+        )
+        if link:
+            await _lattice_patch(
+                f"/admin/links/{link['id']}", headers,
+                {"is_context": is_context},
+            )
+            state = "blessed as AI context" if is_context else "demoted to discoverable"
+            return f"Link {link['id']}: {state} for {entity_type}/{entity_id}"
+        # No existing link — create one with the desired state.
+        new_link = await _lattice_post(
+            "/admin/links", headers,
+            {"document_id": document_id, "entity_type": entity_type,
+             "entity_id": entity_id, "is_context": is_context},
+        )
+        ctx = "as AI context" if is_context else "as discoverable"
+        return (
+            f"Created link {new_link['id']}: doc {document_id} linked to "
+            f"{entity_type}/{entity_id} {ctx}"
+        )
 
     @mcp.tool()
     async def move_document(document_id: str, folder_id: str = "") -> str:
