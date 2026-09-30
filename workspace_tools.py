@@ -178,6 +178,32 @@ def register_workspace_tools(mcp, auth_headers_fn, org_id_fn):
         return _fmt(r.json())
 
     @mcp.tool()
+    async def workspace_push_to_repo(lp_id: str, repo_name: str) -> str:
+        """Sync Lattice-authored doc edits back to the repo as a single
+        draft PR. Walks every doc that was imported from this repo,
+        compares against the workspace clone, opens ONE PR with all
+        creates / updates / deletes. SHA-drift docs (both sides changed
+        since last sync) are skipped and reported so a human resolves.
+
+        Returns per-change counts (`creates`, `updates`, `deletes`,
+        `diverged`, `unchanged`) + the PR URL when a PR was opened.
+        When nothing has changed since the last sync, returns
+        `changes: 0` without opening a PR.
+
+        Admin-gated. Requires `ai_github_pat` in the org's secrets
+        (Settings → Organization → AI Config); returns 412 if missing."""
+        prefix = await _org_path_prefix(lp_id)
+        # Long timeout — the batch may open a PR that includes a git
+        # push, and CI-behind-a-firewall clones can take a while.
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{AI_RUNNER_URL}{prefix}/repos/{repo_name}/push-to-repo",
+                headers=await auth_headers_fn(), timeout=300,
+            )
+        _raise_for(r, "workspace_push_to_repo")
+        return _fmt(r.json())
+
+    @mcp.tool()
     async def workspace_sync_repo(lp_id: str, repo_name: str) -> str:
         """Full-chain repo sync: git fetch + structural survey + tree-
         sitter symbol reindex + repo-doc RAG reindex. Same 4 steps the
