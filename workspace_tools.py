@@ -178,6 +178,32 @@ def register_workspace_tools(mcp, auth_headers_fn, org_id_fn):
         return _fmt(r.json())
 
     @mcp.tool()
+    async def workspace_sync_repo(lp_id: str, repo_name: str) -> str:
+        """Full-chain repo sync: git fetch + structural survey + tree-
+        sitter symbol reindex + repo-doc RAG reindex. Same 4 steps the
+        hourly cron runs; use this after a merge to get an immediate
+        refresh instead of waiting up to an hour for the next cycle.
+
+        Returns a per-step summary: `head_before`, `head_after`,
+        `changed` (bool), and a `steps` map with per-step outcome
+        (`ok` or `error: ...`). Steps 2-4 run even if one fails so
+        you can see the whole picture — but if step 1 (git fetch)
+        errors, the endpoint returns 502 and nothing downstream runs.
+
+        Admin-gated (same as fetch / rescan / reindex-symbols). 404
+        if the repo isn't attached."""
+        prefix = await _org_path_prefix(lp_id)
+        # Long timeout — a big repo hits the embeddings service N times
+        # during doc reindex. 300s covers the mr-fusion repo comfortably.
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{AI_RUNNER_URL}{prefix}/repos/{repo_name}/sync",
+                headers=await auth_headers_fn(), timeout=300,
+            )
+        _raise_for(r, "workspace_sync_repo")
+        return _fmt(r.json())
+
+    @mcp.tool()
     async def workspace_get_survey(lp_id: str, repo_name: str) -> str:
         """Read the last-persisted RepoSurvey for this repo. 404 if
         never scanned. Read-only — member-accessible."""
