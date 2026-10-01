@@ -599,10 +599,16 @@ async def create_task(
     description: str = "",
     priority: str = "medium",
     op_id: str = "",
-    as_draft: bool = False,
+    as_draft: bool = True,
     estimate: str = "",
 ) -> str:
     """Create a new packet (task) in a project.
+
+    MCP tickets land in **draft** by default — this tool is called by
+    AI assistants, and draft is the review-first state reserved for
+    AI-authored tickets. Human users creating via the Dispatch UI get
+    `triage` (board-go's new default). Pass `as_draft=False` only when
+    you're deliberately mirroring a human-created ticket.
 
     When creating tasks, always include an estimate based on complexity:
       xs (~30min) — trivial config change, typo fix, one-liner
@@ -617,7 +623,8 @@ async def create_task(
         description: Packet description
         priority: low, medium, high, critical
         op_id: Optional Op (sub-project) ID to assign to
-        as_draft: If true, creates in draft state for review
+        as_draft: Default True — AI-created tickets land in draft awaiting
+            human review. Pass False to force triage (rare).
         estimate: T-shirt size estimate: xs, s, m, l, xl — always set this based on task complexity
     """
     body: dict[str, Any] = {
