@@ -1480,17 +1480,42 @@ async def trigger_regroom(task_id: str) -> str:
     return f"Triggered regroom for task {task_id}"
 
 
-# trigger_reenrich + trigger_rebootstrap removed 2026-09-10. Board-go
-# only wires webhook Push on task-level triggers today (see
-# services/board-go/internal/api/task_triggers.go) — project/op PUT
-# handlers fan out via SSE but never hit AI Runner's webhook. Adding
-# these back requires wh.Push calls in updateProjectHandler +
-# updateSubProjectHandler with event="project.updated" /
-# event="op.updated". Follow-up ticket in Board Service backlog.
-#
-# For now, the sync_workspace_to_lp tool's bootstrap-trigger flag
-# still works because syncing repos hits PUT /projects/:id which will
-# start emitting a webhook event once the follow-up ships.
+@mcp.tool()
+async def trigger_reenrich(op_id: str) -> str:
+    """Re-trigger AI enrichment on an Op — regenerates summary, relevant
+    files, confidence score.
+
+    Does a no-op PATCH to the Op, which fires board-go's `op.updated`
+    webhook. AI Runner's router maps that event to the ENRICH_OP
+    pipeline. Restored in 9a27909f once board-go started emitting
+    op.updated webhooks (previously the tool had nothing to trigger).
+
+    Args:
+        op_id: UUID of the Op to re-enrich
+    """
+    # board-go routes PATCH + PUT to the same handler for sub-projects
+    # (see internal/api/router.go). _put covers both.
+    await _put(f"/sub-projects/{op_id}", {})
+    return f"Triggered re-enrich for Op {op_id}"
+
+
+@mcp.tool()
+async def trigger_rebootstrap(project_id: str) -> str:
+    """Re-trigger LP bootstrap on a project — refreshes workspace
+    context, re-fetches attached repos, rebuilds symbol index.
+
+    Does a no-op PATCH to the project, which fires board-go's
+    `project.updated` webhook (or `project.repos_changed` if the
+    repos array changed). AI Runner's router maps either event to
+    the REBOOTSTRAP pipeline. Restored in 9a27909f.
+
+    Args:
+        project_id: UUID of the project (LP) to rebootstrap
+    """
+    # Same PATCH/PUT alias on board-go — _put reaches the same handler
+    # as a browser-side PATCH.
+    await _put(f"/projects/{project_id}", {})
+    return f"Triggered rebootstrap for project {project_id}"
 
 
 # ── Notification Tools ───────────────────────────────────────
