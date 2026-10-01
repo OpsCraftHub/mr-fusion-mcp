@@ -82,6 +82,126 @@ def _fmt(data: Any) -> str:
     return json.dumps(data, indent=2, default=str)
 
 
+# ── User id resolution ───────────────────────────────────────
+#
+# Problem: bare usernames like "ross" passed to assign_task used to
+# land verbatim in task_assignees.user_id. Board queries /tasks/mine
+# by the caller's KC subject UUID, so a username-keyed row is invisible
+# to the person it was assigned to. 12 "ross"-keyed rows were stranded
+# in prod before we noticed (patched manually via kubectl at the time).
+#
+# This resolver walks board-go's /settings/users (realm user list,
+# owner/admin only) and matches the caller-supplied value against:
+#   - KC subject UUID (fast path — accepts UUIDs unchanged)
+#   - username (case-insensitive)
+#   - email (case-insensitive)
+#   - full name (first + last concatenated, case-insensitive)
+#
+# Clear error on no-match / ambiguous-match (prod regret was 200 OK
+# with silently-bad data; loudly refusing is better).
+
+import re
+import uuid as _uuid
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+_user_cache: dict[str, list[dict]] | None = None
+
+
+def _is_uuid(value: str) -> bool:
+    """Cheap check — board-go stores KC subject as a UUID so any input
+    that parses as a UUID is already in the right shape. Avoids a
+    network hop on the common case."""
+    if not value or not _UUID_RE.match(value):
+        return False
+    try:
+        _uuid.UUID(value)
+        return True
+    except ValueError:
+        return False
+
+
+async def _list_realm_users() -> list[dict]:
+    """Fetch + memoise the realm user list. Owner/admin only — if the
+    MCP's token lacks the role we fail loud (so the caller sees a
+    specific permission error instead of a mystery "user not found")."""
+    global _user_cache
+    if _user_cache is not None:
+        return _user_cache["users"]
+    try:
+        data = await _get("/settings/users")
+    except Exception as e:
+        raise Exception(
+            f"Could not list realm users to resolve a bare username. "
+            f"The MCP's bound user needs org owner/admin role on "
+            f"/settings/users. Underlying error: {e}"
+        ) from e
+    users = data if isinstance(data, list) else data.get("items", [])
+    _user_cache = {"users": users}
+    return users
+
+
+async def _resolve_user_id(identifier: str) -> str:
+    """Return the KC subject UUID for an identifier that might be a
+    UUID, username, email, or full name.
+
+    - UUID → passed through as-is (fast path, no network hop)
+    - username / email / full name match (case-insensitive) → UUID
+    - 0 matches → raise with a short "no user matches X" message
+    - >1 matches → raise with the candidate list so caller can pick
+    """
+    identifier = (identifier or "").strip()
+    if not identifier:
+        raise ValueError("user_id is required")
+    if _is_uuid(identifier):
+        return identifier
+
+    users = await _list_realm_users()
+    needle = identifier.lower()
+
+    # Priority order: exact username → exact email → exact name →
+    # fallback case-insensitive substring. Only count exact matches
+    # for ambiguity detection; substring matches that disagree are
+    # a sign the caller should be more specific.
+    exact: list[dict] = []
+    for u in users:
+        if (u.get("username", "") or "").lower() == needle:
+            exact.append(u); continue
+        if (u.get("email", "") or "").lower() == needle:
+            exact.append(u); continue
+        if (u.get("name", "") or "").lower() == needle:
+            exact.append(u); continue
+
+    if len(exact) == 1:
+        return exact[0]["id"]
+    if len(exact) > 1:
+        candidates = ", ".join(f"{u.get('name') or u.get('username')} ({u['id']})" for u in exact)
+        raise ValueError(
+            f"Ambiguous user '{identifier}' — multiple matches: {candidates}. "
+            f"Pass the UUID directly to disambiguate."
+        )
+
+    # No exact match — try prefix on username so "ro" → "ross" works.
+    prefix = [u for u in users if (u.get("username", "") or "").lower().startswith(needle)]
+    if len(prefix) == 1:
+        return prefix[0]["id"]
+
+    raise ValueError(
+        f"No realm user matches '{identifier}'. Use list_members() to find "
+        f"the right username or UUID."
+    )
+
+
+def _invalidate_user_cache() -> None:
+    """Call after any realm-user mutation (none exist in this MCP yet,
+    but keeping the hook so future create_user tools can reset)."""
+    global _user_cache
+    _user_cache = None
+
+
 # ── Read Tools ───────────────────────────────────────────────
 
 
@@ -665,16 +785,20 @@ async def assign_to_op(task_id: str, op_id: str) -> str:
 async def assign_task(task_id: str, user_id: str) -> str:
     """Assign a team member to a packet (task).
 
-    The user must be a member of the project's team. Use list_members() first
-    to find valid user IDs.
+    Accepts a KC subject UUID, username, email, or full name — this
+    tool resolves to the KC subject before writing. "ross" and the
+    UUID both work; the ambiguity danger is multiple exact matches,
+    which raise with the candidate list so you can pick.
 
     Args:
         task_id: UUID of the task
-        user_id: UUID of the user to assign
+        user_id: UUID / username / email / full name of the user to assign
     """
-    await _post(f"/tasks/{task_id}/assignees", {"user_id": user_id})
+    resolved = await _resolve_user_id(user_id)
+    await _post(f"/tasks/{task_id}/assignees", {"user_id": resolved})
     task = await _get(f"/tasks/{task_id}")
-    return f"Assigned user {user_id} to '{task['title']}'"
+    note = f" (resolved from '{user_id}')" if resolved != user_id else ""
+    return f"Assigned user {resolved}{note} to '{task['title']}'"
 
 
 @mcp.tool()
@@ -1022,8 +1146,11 @@ async def delegate_criterion(task_id: str, criterion_index: int, user_id: str) -
     Args:
         task_id: UUID of the parent task
         criterion_index: Zero-based index of the criterion to delegate
-        user_id: UUID of the user to delegate to
+        user_id: UUID / username / email / full name of the user to delegate to
     """
+    # Resolve user_id to a KC subject before writing — same pattern
+    # assign_task uses. See _resolve_user_id docstring for the rules.
+    user_id = await _resolve_user_id(user_id)
     data = await _post(
         f"/tasks/{task_id}/criteria/{criterion_index}/delegate",
         {"user_id": user_id},
@@ -1041,8 +1168,9 @@ async def delegate_op_criterion(op_id: str, criterion_index: int, user_id: str) 
     Args:
         op_id: UUID of the Op (sub-project)
         criterion_index: Zero-based index of the criterion to delegate
-        user_id: UUID of the user to delegate to
+        user_id: UUID / username / email / full name of the user to delegate to
     """
+    user_id = await _resolve_user_id(user_id)
     data = await _post(
         f"/sub-projects/{op_id}/criteria/{criterion_index}/delegate",
         {"user_id": user_id},
@@ -1374,8 +1502,11 @@ async def pick_next_task(project_id: str, user_id: str = "") -> str:
 
     Args:
         project_id: UUID of the project
-        user_id: Optional user ID to filter to tasks assigned to this user
+        user_id: Optional UUID / username / email of the user to filter
+            tasks assigned to. Resolves via list_members() if bare.
     """
+    if user_id:
+        user_id = await _resolve_user_id(user_id)
     board = await _get(f"/projects/{project_id}/board")
     project_name = board["project"]["name"]
 
