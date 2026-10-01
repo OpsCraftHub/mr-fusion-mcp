@@ -1493,6 +1493,164 @@ async def trigger_regroom(task_id: str) -> str:
 # start emitting a webhook event once the follow-up ships.
 
 
+# ── Notification Tools ───────────────────────────────────────
+#
+# First slice of a69b3c97. Lets Claude surface "you have N unread
+# mentions" at the start of a session + bulk-clear from the CLI
+# without opening the UI bell.
+
+
+@mcp.tool()
+async def list_notifications(unread_only: bool = False, limit: int = 20) -> str:
+    """List notifications for the caller — mentions, task assignments, Op events.
+
+    Use at the start of a standup or when the user asks "what's new /
+    anything I missed". Pair with mark_all_notifications_read once
+    they've been read into the chat.
+
+    Args:
+        unread_only: If true, only return unread notifications.
+        limit: Max rows (default 20, max 200).
+    """
+    params: dict[str, Any] = {"limit": max(1, min(limit, 200))}
+    if unread_only:
+        params["unread_only"] = "true"
+    rows = await _get("/notifications", params)
+    if not rows:
+        return "No unread notifications." if unread_only else "No notifications."
+    lines = []
+    for n in rows:
+        actor = n.get("actor_name") or n.get("actor_id") or "someone"
+        body = n.get("body") or {}
+        preview = body.get("preview") or body.get("comment") or body.get("title") or ""
+        if len(preview) > 120:
+            preview = preview[:120] + "…"
+        read_marker = "" if n.get("read_at") else " [UNREAD]"
+        task_ref = f" task={n['task_id']}" if n.get("task_id") else ""
+        proj_ref = f" project={n['project_id']}" if n.get("project_id") else ""
+        extra = f" — {preview}" if preview else ""
+        lines.append(
+            f"- {n['created_at'][:16]} [{n['kind']}]{read_marker} by {actor}"
+            f"{task_ref}{proj_ref} (id: {n['id']}){extra}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def mark_notification_read(notification_id: str) -> str:
+    """Mark one notification as read.
+
+    Idempotent — a 204 (already read / not yours) returns the same
+    confirmation as a fresh mark. Use mark_all_notifications_read for
+    bulk clear instead of looping this.
+
+    Args:
+        notification_id: UUID of the notification row.
+    """
+    await _post(f"/notifications/{notification_id}/read", {})
+    return f"Marked notification {notification_id} as read."
+
+
+@mcp.tool()
+async def mark_all_notifications_read() -> str:
+    """Mark every notification for the caller as read.
+
+    Clears the bell. Non-destructive — the rows stay, only `read_at`
+    is stamped. Useful after a standup where the user has heard all
+    the pending items.
+    """
+    await _post("/notifications/mark-all-read", {})
+    return "Marked all notifications as read."
+
+
+# ── My-tasks + inventory tools ───────────────────────────────
+#
+# Second slice of a69b3c97. The "what am I on / what's left to groom /
+# who's on the team" basics that let Claude answer standup questions
+# without the user naming a project first.
+
+
+@mcp.tool()
+async def get_my_tasks() -> str:
+    """List every task assigned to the caller — the user's capacity stack.
+
+    Includes planned + actual dates, status flags (late / overrunning),
+    estimate badges. The right answer to "what am I working on today?"
+    for the authenticated user.
+    """
+    rows = await _get("/tasks/mine")
+    tasks = rows.get("items", rows) if isinstance(rows, dict) else rows
+    if not tasks:
+        return "No tasks assigned to you."
+    lines = []
+    for t in tasks:
+        flags = []
+        if t.get("is_blocked"):
+            flags.append("BLOCKED")
+        if t.get("is_late"):
+            flags.append("LATE")
+        if t.get("is_overrunning"):
+            flags.append("OVERRUNNING")
+        flag_str = f" [{', '.join(flags)}]" if flags else ""
+        est = f" ({t['estimate']})" if t.get("estimate") else ""
+        due = f" due={t['planned_end'][:10]}" if t.get("planned_end") else ""
+        lines.append(
+            f"- [{t['workflow_status']}] {t['title']}{est}{flag_str}{due} "
+            f"(id: {t['id']})"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def list_unscheduled(project_id: str = "") -> str:
+    """List tasks not yet pulled into a sprint — the grooming queue.
+
+    Optional project_id scopes the view; empty returns org-wide.
+    Pairs with pick_next_task + groom_and_ready for a "clean the
+    backlog" session.
+
+    Args:
+        project_id: Optional UUID — filter to one LP.
+    """
+    params: dict[str, Any] = {}
+    if project_id:
+        params["project_id"] = project_id
+    rows = await _get("/tasks/unscheduled", params)
+    tasks = rows.get("items", rows) if isinstance(rows, dict) else rows
+    if not tasks:
+        return "No unscheduled tasks." + (f" (project={project_id})" if project_id else "")
+    lines = []
+    for t in tasks:
+        est = f" ({t['estimate']})" if t.get("estimate") else ""
+        lines.append(
+            f"- [{t['workflow_status']}] {t['title']}{est} "
+            f"(priority: {t.get('priority', 'medium')}, id: {t['id']})"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def list_users() -> str:
+    """List users in the caller's org — assignee + mention candidates.
+
+    Returns the slim shape board-go uses for assignee dropdowns (id,
+    name, username, email). Scoped to the current org via /users (see
+    board-go listUsersLightHandler) — gotBot members won't show up on
+    the opscraft org and vice versa.
+    """
+    data = await _get("/users")
+    users = data.get("users", []) if isinstance(data, dict) else data
+    if not users:
+        return "No users in this org."
+    lines = []
+    for u in users:
+        name = u.get("name") or u.get("username") or u.get("email") or "unknown"
+        email = f" <{u['email']}>" if u.get("email") else ""
+        username = f" ({u['username']})" if u.get("username") and u.get("username") != name else ""
+        lines.append(f"- {name}{username}{email} — id: {u['id']}")
+    return "\n".join(lines)
+
+
 # ── Workflow Intelligence Tools ──────────────────────────────
 
 
