@@ -360,6 +360,59 @@ def register_ledger_tools(mcp, auth_headers_fn):
         await _post(f"/contacts/{cid}/archive", headers)
         return f"Archived contact {contact_name or cid}"
 
+    @mcp.tool()
+    async def approve_contact_review(contact_id: str = "", contact_name: str = "") -> str:
+        """Approve an AI-created contact that's waiting on human review.
+
+        Flips review_state from ai_pending_review → active. Needed before
+        the contact can be used on invoices/bills raised from the UI.
+        """
+        headers = await auth_headers_fn()
+        cid = await _resolve_contact_id(headers, contact_id, contact_name)
+        c = await _post(f"/contacts/{cid}/approve-review", headers)
+        return f"Approved: {c['name']} (review_state={c.get('review_state','?')})"
+
+    @mcp.tool()
+    async def get_contact_statement(
+        contact_id: str = "",
+        contact_name: str = "",
+        from_date: str = "",
+        to_date: str = "",
+        unmatched_only: bool = False,
+    ) -> str:
+        """Unified statement for a contact — bills (AP), invoices (AR), and
+        payments in date order with running AP/AR balances.
+
+        Args:
+            contact_id / contact_name: Who to pull the statement for
+            from_date / to_date: YYYY-MM-DD, both optional
+            unmatched_only: Hide fully-matched rows (leaves outstanding only)
+        """
+        headers = await auth_headers_fn()
+        cid = await _resolve_contact_id(headers, contact_id, contact_name)
+        params: dict[str, Any] = {}
+        if from_date:
+            params["from_date"] = from_date
+        if to_date:
+            params["to_date"] = to_date
+        if unmatched_only:
+            params["unmatched_only"] = "true"
+        r = await _get(f"/contacts/{cid}/statement", headers, params)
+        lines = [
+            f"Statement: {r['contact_name']} [{r['contact_type']}]",
+            f"  period: {r.get('from_date') or '—'} → {r.get('to_date') or '—'}",
+            f"  opening AP={r['opening_ap']}  AR={r['opening_ar']}",
+            f"  closing AP={r['closing_ap']}  AR={r['closing_ar']}",
+            f"  {len(r['rows'])} row(s):",
+        ]
+        for row in r["rows"]:
+            ref = f" ref={row['reference']}" if row.get("reference") else ""
+            lines.append(
+                f"    {row['date']}  [{row['type']:7}] [{row['match_status']:9}]  total={row['total']}  "
+                f"matched={row['matched']}  out={row['outstanding']}  AP={row['running_ap']}  AR={row['running_ar']}{ref}"
+            )
+        return "\n".join(lines)
+
     # ── Cashbook: bank txns + CSV import + categorise + rules ─
 
     @mcp.tool()
@@ -568,6 +621,151 @@ def register_ledger_tools(mcp, auth_headers_fn):
         await _delete(f"/bank-rules/{rule_id}", headers)
         return f"Deleted rule {rule_id}"
 
+    @mcp.tool()
+    async def create_bank_transaction(
+        transaction_date: str,
+        description: str,
+        amount: str,
+        account_code: str = "",
+        account_id: str = "",
+        bank_account_number: str = "",
+        reference: str = "",
+        fees: str = "",
+        running_balance: str = "",
+    ) -> str:
+        """Add a bank transaction manually (source=manual). Use import_bank_csv
+        for statement uploads; this is for one-off entries that aren't on a CSV.
+
+        Args:
+            transaction_date: YYYY-MM-DD
+            description: Narrative on the statement
+            amount: Signed amount as string ('1500.00' = money in, '-250.00' = money out)
+            account_code: 1xxx bank account code (resolved to UUID)
+            account_id: Same but by UUID (overrides account_code)
+            bank_account_number: Account number string (for grouping across CSVs)
+            reference: Payment reference
+            fees: Separate bank-fee component (same sign convention)
+            running_balance: Account balance after this line (helps cross-format dedup)
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {
+            "transaction_date": transaction_date,
+            "description": description,
+            "amount": amount,
+        }
+        if account_code or account_id:
+            body["account_id"] = await _resolve_account_id(headers, account_id, account_code)
+        if bank_account_number:
+            body["bank_account_number"] = bank_account_number
+        if reference:
+            body["reference"] = reference
+        if fees:
+            body["fees"] = fees
+        if running_balance:
+            body["running_balance"] = running_balance
+        t = await _post("/bank-transactions", headers, body)
+        return f"Created bank_txn {t['id']}  {t['transaction_date']}  {t['amount']}  {t['description'][:60]}"
+
+    @mcp.tool()
+    async def unreconcile_bank_transaction(txn_id: str) -> str:
+        """Unreconcile a categorised bank transaction (standard flow only).
+
+        Clears the account_id/alloc_type/VAT fields and reverses the posted
+        journal. Rejects payment-flow (debtor/creditor_payment) categorisations
+        — those must be unwound via force_delete_bank_transaction instead.
+        """
+        headers = await auth_headers_fn()
+        t = await _post(f"/bank-transactions/{txn_id}/unreconcile", headers)
+        return f"Unreconciled txn {t['id']}  — reconciled={t.get('is_reconciled')}  alloc_type={t.get('alloc_type') or '—'}"
+
+    @mcp.tool()
+    async def preview_bank_csv(file_path: str) -> str:
+        """Parse a bank CSV + detect format + count duplicates WITHOUT writing anything.
+
+        Lets you sanity-check an import before committing it. Returns row counts,
+        detected format (capitec / fnb / etc.), opening/closing balances, and
+        any warnings/errors the parser hit.
+
+        Args:
+            file_path: Absolute path to a .csv on this machine
+        """
+        p = Path(file_path).expanduser()
+        if not p.exists():
+            raise Exception(f"File not found: {p}")
+        if p.suffix.lower() != ".csv":
+            raise Exception("File must be a .csv")
+        headers = await auth_headers_fn()
+        with p.open("rb") as fh:
+            files = {"file": (p.name, fh.read(), "text/csv")}
+        r = await _post_multipart("/bank-transactions/csv-preview", headers, files)
+        lines = [
+            f"Preview: {r['total_rows']} row(s), {r['new_rows']} new, {r['duplicate_rows']} duplicate.",
+            f"  format: {r.get('format_detected','?')}  account: {r.get('account_number') or '-'}",
+        ]
+        if r.get("opening_balance") is not None:
+            lines.append(f"  balance: {r['opening_balance']} → {r['closing_balance']}")
+        if r.get("min_date"):
+            lines.append(f"  date range: {r['min_date']} → {r['max_date']}")
+        for w in r.get("warnings", []) or []:
+            lines.append(f"  WARN  {w}")
+        for e in r.get("errors", []) or []:
+            lines.append(f"  ERR   {e}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def list_import_batches() -> str:
+        """List bank CSV import batches (one per upload)."""
+        headers = await auth_headers_fn()
+        rows = await _get("/bank-transactions/batches", headers)
+        if not rows:
+            return "No import batches."
+        lines = [f"{len(rows)} batch(es):"]
+        for b in rows:
+            lines.append(
+                f"  {b.get('created_at','?')}  {b.get('filename','?'):40}  rows={b.get('row_count','?')}  format={b.get('format_detected','?')}  id: {b['id']}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def delete_import_batch(batch_id: str) -> str:
+        """Delete an import batch and all its unreconciled rows.
+
+        Rejected if any row in the batch has been reconciled — those must be
+        unreconciled first (or force_delete_bank_transaction'd one by one).
+        """
+        headers = await auth_headers_fn()
+        await _delete(f"/bank-transactions/batches/{batch_id}", headers)
+        return f"Deleted import batch {batch_id}"
+
+    @mcp.tool()
+    async def backfill_import_hashes() -> str:
+        """Recompute import_hash for every bank transaction using the current
+        (account_number + date + amount + running_balance) formula.
+
+        Idempotent one-shot used after unifying the hash algorithm — rows with
+        the old description-based hash get updated so re-importing the same
+        statement no longer creates duplicates. Skips rows missing
+        bank_account_number or running_balance (manual entries).
+        """
+        headers = await auth_headers_fn()
+        r = await _post("/bank-transactions/backfill-import-hashes", headers)
+        return f"Backfill complete — total={r.get('total')}  updated={r.get('updated')}  skipped={r.get('skipped')}"
+
+    @mcp.tool()
+    async def backfill_journals() -> str:
+        """Retroactively post journals for standard-flow categorised bank txns
+        that were never journalled (data from before the auto-post was wired).
+
+        Owner-only. Skips any txn without an account_id/alloc_type and any
+        payment-flow row (those post journals via create_payment instead).
+        """
+        headers = await auth_headers_fn()
+        r = await _post("/bank-transactions/backfill-journals", headers)
+        return (
+            f"Backfill complete — total={r.get('total')}  posted={r.get('posted')}  "
+            f"skipped={r.get('skipped')}  errored={r.get('errored')}"
+        )
+
     # ── Invoices ──────────────────────────────────────────────
 
     @mcp.tool()
@@ -655,6 +853,34 @@ def register_ledger_tools(mcp, auth_headers_fn):
         inv = await _post(f"/invoices/{invoice_id}/send", headers)
         return f"Sent invoice {inv['invoice_number']}"
 
+    @mcp.tool()
+    async def update_invoice(
+        invoice_id: str,
+        contact_name: str = "",
+        contact_id: str = "",
+        invoice_date: str = "",
+        due_date: str = "",
+        notes: str = "",
+        reference: str = "",
+    ) -> str:
+        """Update an invoice's header fields. Line items are NOT editable
+        post-creation — reverse + recreate if you need to change them.
+
+        Empty fields are left unchanged.
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {}
+        if contact_name or contact_id:
+            body["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        for k, v in {"invoice_date": invoice_date, "due_date": due_date,
+                     "notes": notes, "reference": reference}.items():
+            if v:
+                body[k] = v
+        if not body:
+            return "Nothing to update — provide at least one field."
+        inv = await _put(f"/invoices/{invoice_id}", headers, body)
+        return f"Updated invoice {inv['invoice_number']}"
+
     # ── Credit notes ──────────────────────────────────────────
 
     @mcp.tool()
@@ -678,6 +904,56 @@ def register_ledger_tools(mcp, auth_headers_fn):
         headers = await auth_headers_fn()
         cn = await _post(f"/credit-notes/{credit_note_id}/post", headers)
         return f"Posted credit note {cn.get('credit_note_number', credit_note_id)}"
+
+    @mcp.tool()
+    async def create_credit_note(
+        credit_date: str,
+        lines: list[dict],
+        invoice_id: str = "",
+        contact_name: str = "",
+        contact_id: str = "",
+        reason: str = "",
+    ) -> str:
+        """Create a draft credit note. Attach to an invoice OR a contact.
+
+        Posts DR Revenue / CR AR when posted via post_credit_note.
+
+        Args:
+            credit_date: YYYY-MM-DD
+            lines: [{description, quantity, unit_price, vat_type, vat_rate?}] — ≥1
+            invoice_id: Original invoice being credited (optional — use contact alone for standalone CNs)
+            contact_name / contact_id: Customer (required if no invoice_id)
+            reason: Free-form explanation printed on the CN
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {"credit_date": credit_date, "lines": lines}
+        if invoice_id:
+            body["invoice_id"] = invoice_id
+        if contact_name or contact_id:
+            body["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        if reason:
+            body["reason"] = reason
+        r = await _post("/credit-notes", headers, body)
+        cn = r.get("credit_note", r)
+        return f"Created draft credit note {cn.get('credit_note_number','?')} (id: {cn.get('id')})"
+
+    @mcp.tool()
+    async def get_credit_note(credit_note_id: str) -> str:
+        """Fetch a credit note with all line items."""
+        headers = await auth_headers_fn()
+        r = await _get(f"/credit-notes/{credit_note_id}", headers)
+        cn = r.get("credit_note", r)
+        rows = r.get("lines") or cn.get("lines") or []
+        lines = [
+            f"Credit note {cn.get('credit_note_number','?')}  [{cn.get('status','?')}]",
+            f"  date: {cn.get('credit_date')}  invoice_id: {cn.get('invoice_id') or '-'}  contact_id: {cn.get('contact_id') or '-'}",
+            f"  subtotal: {cn.get('subtotal')}  vat: {cn.get('vat_amount')}  total: {cn.get('total')}",
+        ]
+        for l in rows:
+            lines.append(f"    - {l['description']}  qty={l['quantity']}  unit={l['unit_price']}  vat={l.get('vat_type','?')}  line={l.get('line_total','?')}")
+        if cn.get("reason"):
+            lines.append(f"  reason: {cn['reason']}")
+        return "\n".join(lines)
 
     # ── Bills ─────────────────────────────────────────────────
 
@@ -781,6 +1057,155 @@ def register_ledger_tools(mcp, auth_headers_fn):
         return f"Rejected + deleted AI draft {bill_id}"
 
     @mcp.tool()
+    async def update_bill(
+        bill_id: str,
+        contact_name: str = "",
+        contact_id: str = "",
+        bill_number: str = "",
+        bill_date: str = "",
+        due_date: str = "",
+        notes: str = "",
+        vat_claimable: bool | None = None,
+        currency: str = "",
+        exchange_rate: str = "",
+        lines: list[dict] | None = None,
+    ) -> str:
+        """Update a bill. Header-only when `lines` is omitted; full replace
+        (delete + reinsert lines) when `lines` is provided — only legal while
+        the bill is still in 'draft' status. The replace path reverses the
+        existing journal and reposts a new one inside the same tx.
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {}
+        if contact_name or contact_id:
+            body["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        for k, v in {"bill_number": bill_number, "bill_date": bill_date,
+                     "due_date": due_date, "notes": notes,
+                     "currency": currency, "exchange_rate": exchange_rate}.items():
+            if v:
+                body[k] = v
+        if vat_claimable is not None:
+            body["vat_claimable"] = vat_claimable
+        if lines is not None:
+            body["lines"] = lines
+        if not body:
+            return "Nothing to update."
+        r = await _put(f"/bills/{bill_id}", headers, body)
+        b = r.get("bill", r)
+        return f"Updated bill {b.get('bill_number','?')}  status={b.get('status','?')}  total={b.get('total','?')}"
+
+    @mcp.tool()
+    async def update_ai_draft_bill(
+        bill_id: str,
+        contact_name: str = "",
+        contact_id: str = "",
+        bill_number: str = "",
+        bill_date: str = "",
+        due_date: str = "",
+        notes: str = "",
+        vat_claimable: bool | None = None,
+        currency: str = "",
+        exchange_rate: str = "",
+        lines: list[dict] | None = None,
+    ) -> str:
+        """Edit an AI-drafted bill in place before approval. Same shape as
+        update_bill but hits the ai-draft-specific endpoint so the bill stays
+        in 'ai_draft' status rather than moving to 'draft'.
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {}
+        if contact_name or contact_id:
+            body["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        for k, v in {"bill_number": bill_number, "bill_date": bill_date,
+                     "due_date": due_date, "notes": notes,
+                     "currency": currency, "exchange_rate": exchange_rate}.items():
+            if v:
+                body[k] = v
+        if vat_claimable is not None:
+            body["vat_claimable"] = vat_claimable
+        if lines is not None:
+            body["lines"] = lines
+        if not body:
+            return "Nothing to update."
+        r = await _put(f"/bills/{bill_id}/ai-draft", headers, body)
+        b = r.get("bill", r)
+        return f"Updated AI draft {b.get('bill_number','?')}  total={b.get('total','?')}"
+
+    @mcp.tool()
+    async def void_bill(bill_id: str, reason: str = "") -> str:
+        """Void a bill — reverses the posted journal and marks status='void'.
+
+        For 'this bill should never have existed' cases (duplicate, wrong
+        supplier, etc.). Rejected if any payment is already allocated — those
+        must be unallocated first. Not legal from 'void' or 'paid' states.
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {}
+        if reason:
+            body["reason"] = reason
+        r = await _post(f"/bills/{bill_id}/void", headers, body)
+        b = r.get("bill", r)
+        return f"Voided bill {b.get('bill_number', bill_id)}  reason='{reason or '-'}'"
+
+    @mcp.tool()
+    async def bill_audit(bill_id: str) -> str:
+        """Full audit trail for one bill (newest first)."""
+        headers = await auth_headers_fn()
+        rows = await _get(f"/bills/{bill_id}/audit", headers)
+        if not rows:
+            return "No audit events."
+        lines = [f"{len(rows)} event(s):"]
+        for e in rows:
+            lines.append(
+                f"  {e.get('created_at','?')}  {e.get('event_name','?'):26}  actor={e.get('actor_user_id','?')}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def upload_bill_attachment(bill_id: str, file_path: str) -> str:
+        """Upload a receipt / supporting doc to a bill (max 10MB).
+
+        Args:
+            bill_id: UUID of the bill
+            file_path: Absolute path to the file on this machine
+        """
+        p = Path(file_path).expanduser()
+        if not p.exists():
+            raise Exception(f"File not found: {p}")
+        if p.stat().st_size > 10 * 1024 * 1024:
+            raise Exception("Attachment must be under 10MB.")
+        mime = {
+            ".pdf": "application/pdf",
+            ".png": "image/png",
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".heic": "image/heic",
+        }.get(p.suffix.lower(), "application/octet-stream")
+        headers = await auth_headers_fn()
+        with p.open("rb") as fh:
+            files = {"file": (p.name, fh.read(), mime)}
+        a = await _post_multipart(f"/bills/{bill_id}/attachments", headers, files)
+        return f"Uploaded {p.name} → attachment {a.get('id')}"
+
+    @mcp.tool()
+    async def list_bill_attachments(bill_id: str) -> str:
+        """List attachments on a bill."""
+        headers = await auth_headers_fn()
+        rows = await _get(f"/bills/{bill_id}/attachments", headers)
+        if not rows:
+            return "No attachments."
+        lines = [f"{len(rows)} attachment(s):"]
+        for a in rows:
+            lines.append(f"  {a.get('filename','?'):40}  {a.get('content_type','?'):24}  {a.get('size_bytes','?')} B  id: {a['id']}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def delete_bill_attachment(bill_id: str, attachment_id: str) -> str:
+        """Delete a bill attachment (removes the DB row AND the blob)."""
+        headers = await auth_headers_fn()
+        await _delete(f"/bills/{bill_id}/attachments/{attachment_id}", headers)
+        return f"Deleted attachment {attachment_id}"
+
+    @mcp.tool()
     async def retry_ai_invoice_draft(bill_id: str) -> str:
         """Re-run the AI invoice pipeline against an existing ai_draft
         bill's source email. Use after fixing pipeline code — the
@@ -874,6 +1299,45 @@ def register_ledger_tools(mcp, auth_headers_fn):
             body["idempotency_key"] = idempotency_key
         p = await _post("/payments", headers, body)
         return f"Created {p['direction']} payment {p['amount']} on {p['payment_date']} (id: {p['id']})"
+
+    @mcp.tool()
+    async def get_payment(payment_id: str) -> str:
+        """Fetch a payment with all its allocations."""
+        headers = await auth_headers_fn()
+        r = await _get(f"/payments/{payment_id}", headers)
+        p = r.get("payment", r)
+        allocs = r.get("allocations") or p.get("allocations") or []
+        lines = [
+            f"Payment {p['id']}",
+            f"  date: {p['payment_date']}  direction: {p['direction']}  amount: {p['amount']}",
+            f"  contact_id: {p.get('contact_id') or '-'}  reference: {p.get('reference') or '-'}",
+            f"  {len(allocs)} allocation(s):",
+        ]
+        for a in allocs:
+            target = f"bill={a['bill_id']}" if a.get("bill_id") else f"invoice={a.get('invoice_id','?')}"
+            fx = f"  fx_amount={a['foreign_amount']}" if a.get("foreign_amount") else ""
+            lines.append(f"    {target}  amount={a['amount']}{fx}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def allocate_payment(payment_id: str, allocations: list[dict]) -> str:
+        """Allocate (or further allocate) a payment to bills/invoices.
+
+        The payment's bank journal was posted at cashbook-categorise time;
+        this endpoint only records which docs the money settles against and
+        updates each doc's status. If a target doc is foreign-currency, pass
+        `foreign_amount` alongside `amount` so FX corrections can post.
+
+        Args:
+            payment_id: UUID of the payment
+            allocations: [{bill_id?, invoice_id?, amount, foreign_amount?}] — one target per row
+        """
+        headers = await auth_headers_fn()
+        r = await _post(f"/payments/{payment_id}/allocate", headers,
+                        {"allocations": allocations})
+        p = r.get("payment", r)
+        allocs = r.get("allocations") or []
+        return f"Allocated {len(allocs)} line(s) against payment {p['id']} (amount={p['amount']})"
 
     # ── Journal ───────────────────────────────────────────────
 
@@ -1126,16 +1590,877 @@ def register_ledger_tools(mcp, auth_headers_fn):
         return f"Removed member {user_id}"
 
     @mcp.tool()
-    async def list_audit_events(limit: int = 50) -> str:
-        """List recent audit events (admin only)."""
+    async def list_audit_events(
+        event_name: str = "",
+        entity_type: str = "",
+        entity_id: str = "",
+        actor_user_id: str = "",
+        since: str = "",
+        until: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> str:
+        """List audit events (admin only), filterable.
+
+        Args:
+            event_name: Exact match (e.g. 'bill_approved', 'contact_created')
+            entity_type: Exact match (e.g. 'bill', 'contact', 'invoice')
+            entity_id: UUID of a specific entity
+            actor_user_id: KC subject of the actor
+            since: RFC3339 timestamp (inclusive)
+            until: RFC3339 timestamp (exclusive)
+            limit: Page size, 1..500 (default 50)
+            offset: Pagination offset
+        """
         headers = await auth_headers_fn()
-        rows = await _get("/audit-events", headers, {"limit": limit})
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        for k, v in {"event_name": event_name, "entity_type": entity_type,
+                     "entity_id": entity_id, "actor_user_id": actor_user_id,
+                     "since": since, "until": until}.items():
+            if v:
+                params[k] = v
+        r = await _get("/audit-events", headers, params)
+        rows = r.get("items", []) if isinstance(r, dict) else r
+        total = r.get("total") if isinstance(r, dict) else len(rows)
         if not rows:
             return "No audit events."
-        lines = [f"{len(rows)} event(s):"]
+        lines = [f"{len(rows)} of {total} event(s) (limit={limit}, offset={offset}):"]
         for e in rows:
-            lines.append(f"  {e.get('created_at','?')}  {e.get('event_name','?'):26}  {e.get('entity_type','?')}  actor={e.get('actor_id','?')}")
+            lines.append(f"  {e.get('created_at','?')}  {e.get('event_name','?'):26}  {e.get('entity_type','?'):12}  actor={e.get('actor_user_id', e.get('actor_id','?'))}")
         return "\n".join(lines)
+
+    # ── Expenses ──────────────────────────────────────────────
+
+    @mcp.tool()
+    async def list_expenses(status: str = "", account_code: str = "", account_id: str = "") -> str:
+        """List expenses. status = draft | submitted | approved | posted | rejected."""
+        headers = await auth_headers_fn()
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        if account_code or account_id:
+            params["account_id"] = await _resolve_account_id(headers, account_id, account_code)
+        rows = await _get("/expenses", headers, params)
+        if not rows:
+            return "No expenses."
+        lines = [f"{len(rows)} expense(s):"]
+        for e in rows:
+            lines.append(
+                f"  [{e.get('status','?'):9}] {e.get('expense_date','?')}  {e.get('amount','?'):>10}  "
+                f"vat={e.get('vat_type','?'):10} {e.get('description','')[:50]}  id: {e['id']}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def create_expense(
+        expense_date: str,
+        description: str,
+        amount: str,
+        vat_type: str = "standard",
+        account_code: str = "",
+        account_id: str = "",
+        contact_name: str = "",
+        contact_id: str = "",
+    ) -> str:
+        """Record an out-of-pocket expense. VAT is extracted from the inclusive total.
+
+        Auto-posts the journal when a chart of accounts is seeded (DR expense
+        + DR VAT_input / CR Bank). Falls to 'draft' status when chart is missing.
+
+        Args:
+            expense_date: YYYY-MM-DD
+            description: What was bought
+            amount: VAT-INCLUSIVE total as string (e.g. '115.00' for 15% VAT on 100)
+            vat_type: standard | zero_rated | exempt | out_of_scope
+            account_code: Expense account code (5xxx); auto-picks the system 'expenses' account if omitted
+            account_id: Same but by UUID
+            contact_name / contact_id: Supplier/payee (optional)
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {
+            "expense_date": expense_date,
+            "description": description,
+            "amount": amount,
+            "vat_type": vat_type,
+        }
+        if account_code or account_id:
+            body["account_id"] = await _resolve_account_id(headers, account_id, account_code)
+        if contact_name or contact_id:
+            body["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        e = await _post("/expenses", headers, body)
+        return f"Created expense {e['id']}  status={e['status']}  amount={e['amount']}  vat={e.get('vat_amount','0.00')}"
+
+    @mcp.tool()
+    async def get_expense(expense_id: str) -> str:
+        """Fetch one expense."""
+        headers = await auth_headers_fn()
+        e = await _get(f"/expenses/{expense_id}", headers)
+        lines = [
+            f"Expense {e['id']}  [{e.get('status','?')}]",
+            f"  date: {e.get('expense_date')}  amount: {e.get('amount')}  vat: {e.get('vat_amount')} ({e.get('vat_type')})",
+            f"  account_id: {e.get('account_id') or '-'}  contact_id: {e.get('contact_id') or '-'}",
+            f"  description: {e.get('description','')}",
+        ]
+        if e.get("journal_entry_id"):
+            lines.append(f"  journal_entry_id: {e['journal_entry_id']}")
+        if e.get("receipt_key"):
+            lines.append(f"  receipt_key: {e['receipt_key']}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def update_expense(
+        expense_id: str,
+        expense_date: str = "",
+        description: str = "",
+        amount: str = "",
+        vat_type: str = "",
+        account_code: str = "",
+        account_id: str = "",
+        contact_name: str = "",
+        contact_id: str = "",
+    ) -> str:
+        """Update an expense. Only legal in draft/rejected state."""
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {}
+        for k, v in {"expense_date": expense_date, "description": description,
+                     "amount": amount, "vat_type": vat_type}.items():
+            if v:
+                body[k] = v
+        if account_code or account_id:
+            body["account_id"] = await _resolve_account_id(headers, account_id, account_code)
+        if contact_name or contact_id:
+            body["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        if not body:
+            return "Nothing to update."
+        e = await _put(f"/expenses/{expense_id}", headers, body)
+        return f"Updated expense {e['id']}  status={e['status']}"
+
+    @mcp.tool()
+    async def submit_expense(expense_id: str) -> str:
+        """Submit a draft expense for approval. Status draft → submitted."""
+        headers = await auth_headers_fn()
+        e = await _post(f"/expenses/{expense_id}/submit", headers)
+        return f"Submitted expense {e['id']}  status={e['status']}"
+
+    @mcp.tool()
+    async def approve_expense(expense_id: str) -> str:
+        """Approve a submitted expense (owner/admin). Posts the journal
+        and moves to 'posted' status."""
+        headers = await auth_headers_fn()
+        e = await _post(f"/expenses/{expense_id}/approve", headers)
+        return f"Approved expense {e['id']}  status={e['status']}"
+
+    @mcp.tool()
+    async def reject_expense(expense_id: str, reason: str = "") -> str:
+        """Reject a submitted expense. Status submitted → rejected."""
+        headers = await auth_headers_fn()
+        path = f"/expenses/{expense_id}/reject"
+        if reason:
+            path += f"?reason={reason}"
+        e = await _post(path, headers)
+        return f"Rejected expense {e['id']}"
+
+    @mcp.tool()
+    async def upload_expense_receipt(expense_id: str, file_path: str) -> str:
+        """Attach a receipt image / PDF to an expense (max 10MB).
+
+        Args:
+            expense_id: UUID of the expense
+            file_path: Absolute path to the receipt file on this machine
+        """
+        p = Path(file_path).expanduser()
+        if not p.exists():
+            raise Exception(f"File not found: {p}")
+        if p.stat().st_size > 10 * 1024 * 1024:
+            raise Exception("Receipt must be under 10MB.")
+        mime = {
+            ".pdf": "application/pdf",
+            ".png": "image/png",
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".heic": "image/heic",
+        }.get(p.suffix.lower(), "application/octet-stream")
+        headers = await auth_headers_fn()
+        with p.open("rb") as fh:
+            files = {"file": (p.name, fh.read(), mime)}
+        e = await _post_multipart(f"/expenses/{expense_id}/receipt", headers, files)
+        return f"Uploaded receipt → expense {e['id']} (key: {e.get('receipt_key','?')})"
+
+    # ── Quotes ────────────────────────────────────────────────
+
+    @mcp.tool()
+    async def list_quotes(status: str = "", contact_name: str = "", contact_id: str = "") -> str:
+        """List quotes. status = draft | sent | viewed | approved | declined | expired."""
+        headers = await auth_headers_fn()
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        if contact_name or contact_id:
+            params["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        rows = await _get("/quotes", headers, params)
+        if not rows:
+            return "No quotes."
+        lines = [f"{len(rows)} quote(s):"]
+        for q in rows:
+            lines.append(
+                f"  [{q.get('status','?'):9}] {q.get('quote_number','?')}  {q.get('quote_date','?')}  total={q.get('total','?')}  id: {q['id']}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def create_quote(
+        quote_date: str,
+        lines: list[dict],
+        contact_name: str = "",
+        contact_id: str = "",
+        expires_at: str = "",
+        currency: str = "",
+        notes: str = "",
+    ) -> str:
+        """Create a draft quote.
+
+        Args:
+            quote_date: YYYY-MM-DD
+            lines: [{description, quantity, unit_price, vat_rate?, account_id?}] — ≥1. vat_rate defaults to 15.
+            contact_name / contact_id: Customer (optional on creation; required before sending)
+            expires_at: YYYY-MM-DD
+            currency: ISO code (overrides org base)
+            notes: Free-form notes printed on PDF
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {"quote_date": quote_date, "lines": lines}
+        if contact_name or contact_id:
+            body["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        if expires_at:
+            body["expires_at"] = expires_at
+        if currency:
+            body["currency"] = currency
+        if notes:
+            body["notes"] = notes
+        r = await _post("/quotes", headers, body)
+        q = r.get("quote", r)
+        return f"Created draft quote {q.get('quote_number','?')}  total={q.get('total','?')}  (id: {q.get('id')})"
+
+    @mcp.tool()
+    async def get_quote(quote_id: str) -> str:
+        """Fetch a quote with lines + event history."""
+        headers = await auth_headers_fn()
+        r = await _get(f"/quotes/{quote_id}", headers)
+        q = r.get("quote", r)
+        rows = r.get("lines") or []
+        events = r.get("events") or []
+        lines = [
+            f"Quote {q.get('quote_number','?')}  [{q.get('status','?')}]",
+            f"  date: {q.get('quote_date')}  expires: {q.get('expires_at') or '-'}",
+            f"  contact_id: {q.get('contact_id') or '-'}  currency: {q.get('currency') or 'ZAR'}",
+            f"  subtotal: {q.get('subtotal')}  vat: {q.get('vat_amount')}  total: {q.get('total')}",
+        ]
+        for l in rows:
+            lines.append(f"    - {l.get('description','')}  qty={l.get('quantity')}  unit={l.get('unit_price')}  line={l.get('line_total')}")
+        if events:
+            lines.append(f"  {len(events)} event(s):")
+            for e in events[-5:]:
+                lines.append(f"    {e.get('created_at','?')}  {e.get('event_type','?')}  by {e.get('actor_id','?')}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def delete_quote(quote_id: str) -> str:
+        """Delete a quote (only legal in draft status)."""
+        headers = await auth_headers_fn()
+        await _delete(f"/quotes/{quote_id}", headers)
+        return f"Deleted quote {quote_id}"
+
+    @mcp.tool()
+    async def mark_quote_sent(quote_id: str, note: str = "") -> str:
+        """Mark a quote as sent (draft → sent). Does NOT email — see send_quote for that."""
+        headers = await auth_headers_fn()
+        q = await _post(f"/quotes/{quote_id}/mark-sent", headers, {"note": note} if note else {})
+        return f"Marked quote {q.get('quote_number','?')} as sent."
+
+    @mcp.tool()
+    async def mark_quote_approved(quote_id: str, note: str = "") -> str:
+        """Record owner-side approval of a quote (sent/viewed → approved).
+
+        For client-side approvals via magic link, use the public by-token
+        endpoints from the frontend. This tool is for 'customer called me and
+        said yes' cases.
+        """
+        headers = await auth_headers_fn()
+        q = await _post(f"/quotes/{quote_id}/mark-approved", headers, {"note": note} if note else {})
+        return f"Approved quote {q.get('quote_number','?')}."
+
+    @mcp.tool()
+    async def mark_quote_declined(quote_id: str, note: str = "") -> str:
+        """Record owner-side decline of a quote (sent/viewed → declined)."""
+        headers = await auth_headers_fn()
+        q = await _post(f"/quotes/{quote_id}/mark-declined", headers, {"note": note} if note else {})
+        return f"Declined quote {q.get('quote_number','?')}."
+
+    @mcp.tool()
+    async def send_quote(quote_id: str) -> str:
+        """Render the quote PDF, email it via Outbox, and transition to 'sent'.
+
+        Requires the contact to have an email address. Includes a magic link
+        for the customer to view/approve/decline online.
+        """
+        headers = await auth_headers_fn()
+        r = await _post(f"/quotes/{quote_id}/send", headers)
+        return f"Sent to {r.get('to','?')}  magic_link={r.get('magic_link','?')}"
+
+    @mcp.tool()
+    async def convert_quote_to_job_card(quote_id: str) -> str:
+        """Spin up a job card from an approved quote (fixed billing on quote total)."""
+        headers = await auth_headers_fn()
+        jc = await _post(f"/quotes/{quote_id}/convert-to-job-card", headers)
+        return f"Created job card {jc.get('job_number','?')} (id: {jc.get('id')}) from quote {quote_id}"
+
+    # ── Job cards ─────────────────────────────────────────────
+
+    @mcp.tool()
+    async def list_job_cards(status: str = "", contact_name: str = "", contact_id: str = "") -> str:
+        """List job cards. status = active | paused | completed | cancelled."""
+        headers = await auth_headers_fn()
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        if contact_name or contact_id:
+            params["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        rows = await _get("/job-cards", headers, params)
+        if not rows:
+            return "No job cards."
+        lines = [f"{len(rows)} job card(s):"]
+        for jc in rows:
+            billing = jc.get("billing_type", "?")
+            rate = f" @ {jc.get('hourly_rate')}/h" if billing == "hourly" else f" fixed={jc.get('fixed_amount')}"
+            lines.append(
+                f"  [{jc.get('status','?'):9}] {jc.get('job_number','?')}  {billing:6}{rate}  {jc.get('title','')[:50]}  id: {jc['id']}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def create_job_card(
+        title: str,
+        billing_type: str,
+        contact_name: str = "",
+        contact_id: str = "",
+        quote_id: str = "",
+        description: str = "",
+        hourly_rate: str = "",
+        fixed_amount: str = "",
+        budget_hours: str = "",
+        visibility: str = "",
+    ) -> str:
+        """Create a job card. billing_type = hourly | fixed.
+
+        Args:
+            title: Short name shown on the board
+            billing_type: hourly | fixed
+            contact_name / contact_id: Customer this job is for
+            quote_id: Source quote (optional)
+            description: Longer description
+            hourly_rate: Rate per hour (required if billing_type=hourly)
+            fixed_amount: Fixed total (required if billing_type=fixed)
+            budget_hours: Soft cap for burn tracking
+            visibility: internal | client_visible
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {"title": title, "billing_type": billing_type}
+        if contact_name or contact_id:
+            body["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        if quote_id:
+            body["quote_id"] = quote_id
+        if description:
+            body["description"] = description
+        if hourly_rate:
+            body["hourly_rate"] = hourly_rate
+        if fixed_amount:
+            body["fixed_amount"] = fixed_amount
+        if budget_hours:
+            body["budget_hours"] = budget_hours
+        if visibility:
+            body["visibility"] = visibility
+        jc = await _post("/job-cards", headers, body)
+        return f"Created job card {jc.get('job_number','?')} (id: {jc['id']})"
+
+    @mcp.tool()
+    async def get_job_card(job_card_id: str) -> str:
+        """Fetch one job card."""
+        headers = await auth_headers_fn()
+        jc = await _get(f"/job-cards/{job_card_id}", headers)
+        lines = [
+            f"Job card {jc.get('job_number','?')}  [{jc.get('status','?')}]",
+            f"  title: {jc.get('title','')}",
+            f"  billing: {jc.get('billing_type')}  rate: {jc.get('hourly_rate') or '-'}  fixed: {jc.get('fixed_amount') or '-'}  budget_h: {jc.get('budget_hours') or '-'}",
+            f"  contact_id: {jc.get('contact_id') or '-'}  quote_id: {jc.get('quote_id') or '-'}",
+            f"  visibility: {jc.get('visibility') or '-'}",
+        ]
+        if jc.get("description"):
+            lines.append(f"  description: {jc['description']}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def delete_job_card(job_card_id: str) -> str:
+        """Delete a job card. Only legal with no billed time entries."""
+        headers = await auth_headers_fn()
+        await _delete(f"/job-cards/{job_card_id}", headers)
+        return f"Deleted job card {job_card_id}"
+
+    @mcp.tool()
+    async def list_job_card_time_entries(job_card_id: str, include_billed: bool = False) -> str:
+        """List time entries against a job card. Defaults to unbilled only."""
+        headers = await auth_headers_fn()
+        params: dict[str, Any] = {}
+        if include_billed:
+            params["include_billed"] = "true"
+        rows = await _get(f"/job-cards/{job_card_id}/time-entries", headers, params)
+        if not rows:
+            return "No time entries."
+        lines = [f"{len(rows)} entry/ies:"]
+        for e in rows:
+            billed = " [BILLED]" if e.get("invoice_id") else ""
+            lines.append(
+                f"  {e.get('entry_date','?')}  {e.get('hours','?'):>6} h  {e.get('description','') or '-':50}{billed}  id: {e['id']}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def create_job_card_time_entry(
+        job_card_id: str,
+        entry_date: str,
+        hours: str,
+        description: str = "",
+    ) -> str:
+        """Log hours against an hourly job card.
+
+        Args:
+            job_card_id: UUID of the job card
+            entry_date: YYYY-MM-DD
+            hours: Decimal hours as string (e.g. '2.5')
+            description: Optional note
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {"entry_date": entry_date, "hours": hours}
+        if description:
+            body["description"] = description
+        e = await _post(f"/job-cards/{job_card_id}/time-entries", headers, body)
+        return f"Logged {e.get('hours')} h on {e.get('entry_date')} (id: {e['id']})"
+
+    @mcp.tool()
+    async def update_job_card_time_entry(
+        job_card_id: str,
+        entry_id: str,
+        entry_date: str = "",
+        hours: str = "",
+        description: str = "",
+    ) -> str:
+        """Edit a time entry (only legal while unbilled)."""
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {}
+        for k, v in {"entry_date": entry_date, "hours": hours, "description": description}.items():
+            if v:
+                body[k] = v
+        if not body:
+            return "Nothing to update."
+        e = await _patch(f"/job-cards/{job_card_id}/time-entries/{entry_id}", headers, body)
+        return f"Updated time entry {e.get('id')}"
+
+    @mcp.tool()
+    async def delete_job_card_time_entry(job_card_id: str, entry_id: str) -> str:
+        """Delete a time entry (only legal while unbilled)."""
+        headers = await auth_headers_fn()
+        await _delete(f"/job-cards/{job_card_id}/time-entries/{entry_id}", headers)
+        return f"Deleted time entry {entry_id}"
+
+    @mcp.tool()
+    async def invoice_from_job_card(
+        job_card_id: str,
+        from_date: str = "",
+        to_date: str = "",
+        group_by: str = "",
+    ) -> str:
+        """Create an invoice from a job card.
+
+        Hourly: pulls unbilled time entries in the date range, groups by
+        group_by, and bills at the hourly rate. Fixed: creates a single-line
+        invoice for the fixed amount.
+
+        Args:
+            job_card_id: UUID of the job card
+            from_date / to_date: YYYY-MM-DD, both optional (defaults to all unbilled)
+            group_by: none (one line per entry) | week | month
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {}
+        for k, v in {"from_date": from_date, "to_date": to_date, "group_by": group_by}.items():
+            if v:
+                body[k] = v
+        r = await _post(f"/job-cards/{job_card_id}/invoice", headers, body)
+        n = r.get("entries_billed")
+        return f"Created invoice {r.get('invoice_id')}" + (f" from {n} entries" if n is not None else "")
+
+    # ── Purchase orders ───────────────────────────────────────
+
+    @mcp.tool()
+    async def list_purchase_orders(status: str = "", contact_name: str = "", contact_id: str = "") -> str:
+        """List POs. status = draft | sent | acknowledged | received | cancelled."""
+        headers = await auth_headers_fn()
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        if contact_name or contact_id:
+            params["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        rows = await _get("/purchase-orders", headers, params)
+        if not rows:
+            return "No purchase orders."
+        lines = [f"{len(rows)} PO(s):"]
+        for po in rows:
+            lines.append(
+                f"  [{po.get('status','?'):12}] {po.get('po_number','?')}  {po.get('po_date','?')}  total={po.get('total','?')}  id: {po['id']}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def create_purchase_order(
+        po_date: str,
+        lines: list[dict],
+        contact_name: str = "",
+        contact_id: str = "",
+        expected_delivery_date: str = "",
+        currency: str = "",
+        notes: str = "",
+        delivery_address: str = "",
+    ) -> str:
+        """Create a draft purchase order.
+
+        Args:
+            po_date: YYYY-MM-DD
+            lines: [{description, quantity, unit_price, vat_rate?, account_id?}] — ≥1. vat_rate defaults to 15.
+            contact_name / contact_id: Supplier (optional on creation; required before sending)
+            expected_delivery_date: YYYY-MM-DD
+            currency: ISO code
+            notes: Printed on PDF
+            delivery_address: Printed on PDF
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {"po_date": po_date, "lines": lines}
+        if contact_name or contact_id:
+            body["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        if expected_delivery_date:
+            body["expected_delivery_date"] = expected_delivery_date
+        if currency:
+            body["currency"] = currency
+        if notes:
+            body["notes"] = notes
+        if delivery_address:
+            body["delivery_address"] = delivery_address
+        r = await _post("/purchase-orders", headers, body)
+        po = r.get("po", r)
+        return f"Created PO {po.get('po_number','?')}  total={po.get('total','?')}  (id: {po['id']})"
+
+    @mcp.tool()
+    async def get_purchase_order(po_id: str) -> str:
+        """Fetch a PO with lines."""
+        headers = await auth_headers_fn()
+        r = await _get(f"/purchase-orders/{po_id}", headers)
+        po = r.get("po", r)
+        rows = r.get("lines") or []
+        lines = [
+            f"PO {po.get('po_number','?')}  [{po.get('status','?')}]",
+            f"  date: {po.get('po_date')}  expected: {po.get('expected_delivery_date') or '-'}",
+            f"  contact_id: {po.get('contact_id') or '-'}  currency: {po.get('currency') or 'ZAR'}",
+            f"  subtotal: {po.get('subtotal')}  vat: {po.get('vat_amount')}  total: {po.get('total')}",
+        ]
+        for l in rows:
+            lines.append(f"    - {l.get('description','')}  qty={l.get('quantity')}  unit={l.get('unit_price')}  line={l.get('line_total')}")
+        if po.get("delivery_address"):
+            lines.append(f"  delivery: {po['delivery_address']}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def delete_purchase_order(po_id: str) -> str:
+        """Delete a PO (only legal in draft status)."""
+        headers = await auth_headers_fn()
+        await _delete(f"/purchase-orders/{po_id}", headers)
+        return f"Deleted PO {po_id}"
+
+    @mcp.tool()
+    async def mark_po_sent(po_id: str, note: str = "") -> str:
+        """Mark a PO as sent (draft → sent)."""
+        headers = await auth_headers_fn()
+        po = await _post(f"/purchase-orders/{po_id}/mark-sent", headers, {"note": note} if note else {})
+        return f"Sent PO {po.get('po_number','?')}"
+
+    @mcp.tool()
+    async def mark_po_received(po_id: str, note: str = "") -> str:
+        """Mark a PO as received (sent/acknowledged → received)."""
+        headers = await auth_headers_fn()
+        po = await _post(f"/purchase-orders/{po_id}/mark-received", headers, {"note": note} if note else {})
+        return f"Received PO {po.get('po_number','?')}"
+
+    @mcp.tool()
+    async def cancel_purchase_order(po_id: str, note: str = "") -> str:
+        """Cancel a PO (draft/sent/acknowledged → cancelled)."""
+        headers = await auth_headers_fn()
+        po = await _post(f"/purchase-orders/{po_id}/cancel", headers, {"note": note} if note else {})
+        return f"Cancelled PO {po.get('po_number','?')}"
+
+    # ── Cashflow + Runway + Budget review ─────────────────────
+
+    @mcp.tool()
+    async def report_cashflow(from_date: str = "", to_date: str = "") -> str:
+        """Cashflow statement split by operating / investing / financing sections.
+
+        Direct-method cashflow built from the cashbook — categorised bank txns
+        are bucketed by alloc_type (debtor/creditor/revenue/expense → operating)
+        or by the target account's type for other_in/other_out (asset → investing,
+        equity/liability → financing).
+
+        Args:
+            from_date / to_date: YYYY-MM-DD (both optional — defaults to YTD)
+        """
+        headers = await auth_headers_fn()
+        params: dict[str, Any] = {}
+        if from_date:
+            params["from_date"] = from_date
+        if to_date:
+            params["to_date"] = to_date
+        r = await _get("/reports/cashflow", headers, params)
+        lines = [f"Cashflow  {r.get('from_date','?')} → {r.get('to_date','?')}"]
+        for section in ("operating", "investing", "financing"):
+            rows = r.get(section) or []
+            net = r.get(f"net_{section}", 0)
+            lines.append(f"  {section.upper()} (net {net:+.2f}):")
+            for row in rows:
+                lines.append(f"    {row['code']} {row['name']:30}  {row['amount']:>12.2f}")
+        lines.append(f"  NET CHANGE  {r.get('net_change', 0):+.2f}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def report_runway(months: int = 12, include_ar: bool = False) -> str:
+        """Forward cash projection (fixed burn + variable burn + revenue inflow).
+
+        Starts from current bank balance (+ optional AR) and projects monthly
+        balances for N months. Returns three paths: fixed-only, expected
+        (fixed + variable), and worst-case (fixed + variable + 1σ).
+
+        Args:
+            months: 1..60 (default 12)
+            include_ar: Fold accounts receivable into starting cash
+        """
+        headers = await auth_headers_fn()
+        params: dict[str, Any] = {"months": months}
+        if include_ar:
+            params["include_ar"] = "true"
+        r = await _get("/runway", headers, params)
+        lines = [
+            f"Starting: cash={r['starting_cash']}  AR={r['starting_ar']}  include_ar={r['include_ar']}",
+            f"Burn/mo: fixed={r['fixed_burn_per_month']}  variable={r['variable_burn_per_month']} (σ={r['variable_std_per_month']})",
+        ]
+        for m in r.get("months", []):
+            lines.append(
+                f"  {m['month']}  burn fixed={m['fixed_burn']} var={m['variable_burn']} worst={m['worst_case_burn']}  "
+                f"in={m['revenue_inflow']}  bal fixed={m['projected_balance_fixed_only']} exp={m['projected_balance_expected']} worst={m['projected_balance_worst_case']}"
+            )
+        ends = r.get("runway_ends") or {}
+        lines.append(
+            f"Runway ends — fixed_only: {ends.get('fixed_only') or '—'}  "
+            f"expected: {ends.get('expected') or '—'}  worst_case: {ends.get('worst_case') or '—'}"
+        )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def report_runway_health() -> str:
+        """Data-completeness warnings that affect runway accuracy — unapproved
+        AI drafts, stale bank statements, incomplete revenue forecast, etc.
+
+        Each warning carries a frontend CTA href so a human can act on it.
+        """
+        headers = await auth_headers_fn()
+        r = await _get("/runway/health", headers)
+        warnings = r.get("warnings") or []
+        if not warnings:
+            return "No runway health warnings — looking good."
+        lines = [f"{len(warnings)} warning(s):"]
+        for w in warnings:
+            lines.append(f"  [{w.get('kind','?'):22}] {w.get('message','?')}  → {w.get('cta_href','?')}")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def report_budget_review(from_date: str = "", to_date: str = "") -> str:
+        """Budget vs actual per account for a date range.
+
+        Pulls the budget_lines forecast (monthly) and multiplies by the number
+        of months in the range to produce the budgeted figure, then compares to
+        actual postings. Variance = actual - budgeted (positive = over budget).
+
+        Args:
+            from_date / to_date: YYYY-MM-DD (both optional — defaults to YTD)
+        """
+        headers = await auth_headers_fn()
+        params: dict[str, Any] = {}
+        if from_date:
+            params["from"] = from_date
+        if to_date:
+            params["to"] = to_date
+        r = await _get("/budget-review", headers, params)
+        rows = r.get("rows") or []
+        lines = [f"Budget vs actual  {r.get('from','?')} → {r.get('to','?')}  (months={r.get('months_in_range','?')})"]
+        for row in rows:
+            lines.append(
+                f"  {row['account_code']} {row['account_name']:30}  budget={row['budgeted']:>10}  actual={row['actual']:>10}  var={row['variance']:>+10}"
+            )
+        return "\n".join(lines)
+
+    # ── Budget lines ──────────────────────────────────────────
+
+    @mcp.tool()
+    async def list_budget_lines() -> str:
+        """List budget lines (one per expense account). Shows forecast,
+        override, effective amount, and cost type (fixed / variable)."""
+        headers = await auth_headers_fn()
+        rows = await _get("/budget-lines", headers)
+        if not rows:
+            return "No budget lines — call refresh_budget_lines to seed them."
+        lines = [f"{len(rows)} budget line(s):"]
+        for b in rows:
+            override = f" (override={b['amount_override']})" if b.get("amount_override") not in (None, "") else ""
+            ct = b.get("cost_type_effective") or b.get("cost_type_auto") or "?"
+            lines.append(
+                f"  {b['account_code']} {b['account_name']:30}  eff={b['amount_effective']:>10}{override}  type={ct:8}  conf={b.get('confidence',0):.2f}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def patch_budget_line(
+        budget_line_id: str,
+        amount_override: str = "",
+        cost_type_override: str = "",
+        clear_amount_override: bool = False,
+        clear_cost_type_override: bool = False,
+    ) -> str:
+        """Override a budget line's amount or cost_type (owner/admin).
+
+        Pass clear_*_override=True to wipe an existing override and fall back
+        to the auto-forecast value.
+        """
+        import json as _json
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {}
+        if clear_amount_override:
+            body["amount_override"] = _json.loads("null")
+        elif amount_override:
+            body["amount_override"] = amount_override
+        if clear_cost_type_override:
+            body["cost_type_override"] = _json.loads("null")
+        elif cost_type_override:
+            body["cost_type_override"] = cost_type_override
+        if not body:
+            return "Nothing to update."
+        b = await _patch(f"/budget-lines/{budget_line_id}", headers, body)
+        return f"Updated {b['account_code']} {b['account_name']}  eff={b['amount_effective']}  type={b.get('cost_type_effective') or '?'}"
+
+    @mcp.tool()
+    async def refresh_budget_lines() -> str:
+        """Auto-forecast every expense account from 6 months of history.
+
+        Reads posted expense journals, computes mean + coefficient of variation,
+        classifies each account as fixed or variable, and upserts rows —
+        preserving any user-set overrides. Confidence rises with more history.
+        """
+        headers = await auth_headers_fn()
+        rows = await _post("/budget-lines/refresh", headers)
+        if not rows:
+            return "Refreshed — no budget lines returned."
+        return f"Refreshed {len(rows)} budget line(s)."
+
+    # ── Revenue forecast ──────────────────────────────────────
+
+    @mcp.tool()
+    async def list_revenue_forecast(from_date: str = "", to_date: str = "") -> str:
+        """List revenue forecast rows (booked + expected).
+
+        Args:
+            from_date / to_date: YYYY-MM-DD (both optional)
+        """
+        headers = await auth_headers_fn()
+        params: dict[str, Any] = {}
+        if from_date:
+            params["from"] = from_date
+        if to_date:
+            params["to"] = to_date
+        rows = await _get("/revenue-forecast", headers, params)
+        if not rows:
+            return "No forecast rows."
+        lines = [f"{len(rows)} forecast row(s):"]
+        for f in rows:
+            lines.append(
+                f"  [{f.get('confidence','?'):8}] {f.get('expected_date','?')}  {f.get('amount','?'):>10}  {f.get('description','')[:50]}  id: {f['id']}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def create_revenue_forecast(
+        description: str,
+        expected_date: str,
+        amount: str,
+        contact_name: str = "",
+        contact_id: str = "",
+        confidence: str = "expected",
+        parent_id: str = "",
+    ) -> str:
+        """Add a revenue forecast line.
+
+        Args:
+            description: What the money is for
+            expected_date: YYYY-MM-DD
+            amount: Expected inflow as string
+            contact_name / contact_id: Customer (optional)
+            confidence: booked | expected (default expected)
+            parent_id: UUID of a parent forecast (for sub-items)
+        """
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {
+            "description": description,
+            "expected_date": expected_date,
+            "amount": amount,
+            "confidence": confidence,
+        }
+        if contact_name or contact_id:
+            body["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        if parent_id:
+            body["parent_id"] = parent_id
+        f = await _post("/revenue-forecast", headers, body)
+        return f"Created forecast {f['id']}  {f['expected_date']}  {f['amount']}  {f['description'][:50]}"
+
+    @mcp.tool()
+    async def update_revenue_forecast(
+        forecast_id: str,
+        description: str = "",
+        expected_date: str = "",
+        amount: str = "",
+        contact_name: str = "",
+        contact_id: str = "",
+        confidence: str = "",
+    ) -> str:
+        """Update a forecast row."""
+        headers = await auth_headers_fn()
+        body: dict[str, Any] = {}
+        for k, v in {"description": description, "expected_date": expected_date,
+                     "amount": amount, "confidence": confidence}.items():
+            if v:
+                body[k] = v
+        if contact_name or contact_id:
+            body["contact_id"] = await _resolve_contact_id(headers, contact_id, contact_name)
+        if not body:
+            return "Nothing to update."
+        f = await _put(f"/revenue-forecast/{forecast_id}", headers, body)
+        return f"Updated forecast {f['id']}"
+
+    @mcp.tool()
+    async def delete_revenue_forecast(forecast_id: str) -> str:
+        """Delete a forecast row."""
+        headers = await auth_headers_fn()
+        await _delete(f"/revenue-forecast/{forecast_id}", headers)
+        return f"Deleted forecast {forecast_id}"
 
     # ── Document templates (per-doc-type branding) ────────────
 

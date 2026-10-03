@@ -1,8 +1,17 @@
 """Vault — MCP server for the OpsCraft Ledger (bookkeeping) service.
 
-Exposes chart of accounts, contacts, cashbook (CSV import + categorise +
-learned rules), invoices, credit notes, bills (+AI draft flow), payments,
-journal, reports, periods, and members.
+Exposes the full ledger-go /api/v1 surface: chart of accounts, contacts
+(incl. AI-review approval + statements), cashbook (CSV import, preview,
+categorise, learned rules, batches, manual entries, backfills), invoices
+(CRUD + PDF via UI), credit notes (CRUD + post), bills (CRUD, AI draft
+flow, void, attachments, audit), payments (create + allocate across
+foreign-currency docs), journal, reports (trial balance, P&L, balance
+sheet, VAT, aging, cashflow, runway, budget-vs-actual), periods, members,
+audit events, document templates, settings, expenses (full approval
+flow + receipts), quotes (CRUD + send + status transitions + convert to
+job card), job cards (CRUD + time entries + invoice-from-timesheet),
+purchase orders (CRUD + status transitions), budget lines (list / patch /
+auto-refresh), revenue forecast (CRUD).
 """
 
 from mcp.server.fastmcp import FastMCP
