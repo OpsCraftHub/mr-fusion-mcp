@@ -825,7 +825,7 @@ def register_ledger_tools(mcp, auth_headers_fn):
         Args:
             contact_name: Customer name (resolved to id)
             invoice_date: YYYY-MM-DD
-            lines: List of {description, quantity, unit_price, vat_type, vat_rate?}. vat_type = standard|zero_rated|exempt|out_of_scope
+            lines: List of {description, quantity, unit_price, vat_type, vat_rate?}. vat_type = standard|zero_rated|exempt|out_of_scope. vat_rate is a PERCENTAGE (e.g. 15 for 15%, NOT 0.15); omit it to use the org's default_vat_rate.
             contact_id: Alternative to contact_name
             due_date: YYYY-MM-DD (default: invoice_date + 30 days)
             notes: Free-form notes
@@ -920,7 +920,7 @@ def register_ledger_tools(mcp, auth_headers_fn):
 
         Args:
             credit_date: YYYY-MM-DD
-            lines: [{description, quantity, unit_price, vat_type, vat_rate?}] — ≥1
+            lines: [{description, quantity, unit_price, vat_type, vat_rate?}] — ≥1. vat_rate is a PERCENTAGE (e.g. 15 for 15%, NOT 0.15); omit it to use the org's default_vat_rate.
             invoice_id: Original invoice being credited (optional — use contact alone for standalone CNs)
             contact_name / contact_id: Customer (required if no invoice_id)
             reason: Free-form explanation printed on the CN
@@ -1820,7 +1820,7 @@ def register_ledger_tools(mcp, auth_headers_fn):
 
         Args:
             quote_date: YYYY-MM-DD
-            lines: [{description, quantity, unit_price, vat_rate?, account_id?}] — ≥1. vat_rate defaults to 15.
+            lines: [{description, quantity, unit_price, vat_rate?, account_id?}] — ≥1. vat_rate is a PERCENTAGE (e.g. 15 for 15%, NOT 0.15); omit it to use the org's default_vat_rate.
             contact_name / contact_id: Customer (optional on creation; required before sending)
             expires_at: YYYY-MM-DD
             currency: ISO code (overrides org base)
@@ -2133,7 +2133,7 @@ def register_ledger_tools(mcp, auth_headers_fn):
 
         Args:
             po_date: YYYY-MM-DD
-            lines: [{description, quantity, unit_price, vat_rate?, account_id?}] — ≥1. vat_rate defaults to 15.
+            lines: [{description, quantity, unit_price, vat_rate?, account_id?}] — ≥1. vat_rate is a PERCENTAGE (e.g. 15 for 15%, NOT 0.15); omit it to use the org's default_vat_rate.
             contact_name / contact_id: Supplier (optional on creation; required before sending)
             expected_delivery_date: YYYY-MM-DD
             currency: ISO code
@@ -2632,7 +2632,7 @@ def register_ledger_tools(mcp, auth_headers_fn):
         """Patch org Ledger settings. Empty strings / None are left unchanged.
 
         Args:
-            default_vat_rate: Default VAT rate as decimal string (e.g. "0.15" for 15%)
+            default_vat_rate: Default VAT rate as a PERCENTAGE string (e.g. "15" for 15%, "15.5" for 15.5%). Not a decimal fraction — passing "0.15" will be rejected by the backend. Zero is allowed for non-VAT-registered orgs.
             vat_registered: Whether the org is VAT-registered
             vat_number: SARS VAT registration number
             vat_category: monthly | cat_a | cat_b | cat_c | annual
