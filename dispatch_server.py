@@ -313,12 +313,6 @@ async def list_tasks(
         completed_before: Only tasks completed strictly before this date.
     """
     params: dict[str, Any] = {"limit": limit}
-    if status:
-        params["status"] = status
-    if assignee:
-        params["assignee"] = assignee
-    if op_id:
-        params["sub_project_id"] = op_id
     for key, val in (
         ("created_after", created_after),
         ("created_before", created_before),
@@ -327,8 +321,20 @@ async def list_tasks(
     ):
         if val:
             params[key] = val
-    data = await _get(f"/projects/{project_id}/tasks", params)
+    # When op_id is set, hit the Op-scoped endpoint — the project-level
+    # handler ignores sub_project_id as a query param, so routing is the
+    # only way to actually filter server-side.
+    if op_id:
+        data = await _get(f"/sub-projects/{op_id}/tasks", params)
+    else:
+        data = await _get(f"/projects/{project_id}/tasks", params)
     tasks = data.get("items", data) if isinstance(data, dict) else data
+    # status / assignee filters aren't supported by either backend handler;
+    # apply client-side so the MCP's advertised contract holds.
+    if status:
+        tasks = [t for t in tasks if t.get("workflow_status") == status]
+    if assignee:
+        tasks = [t for t in tasks if t.get("assignee") == assignee]
     lines = []
     for t in tasks:
         flags = []
