@@ -307,7 +307,9 @@ def register_ledger_tools(mcp, auth_headers_fn):
             body["default_expense_account_id"] = await _resolve_account_id(
                 headers, account_code=default_expense_account_code)
         c = await _post("/contacts", headers, body)
-        return f"Created {c['contact_type']}: {c['name']} (id: {c['id']})"
+        acc = c.get("account_number")
+        acc_str = f", account #: {acc}" if acc else ""
+        return f"Created {c['contact_type']}: {c['name']} (id: {c['id']}{acc_str})"
 
     @mcp.tool()
     async def get_contact(contact_id: str = "", contact_name: str = "") -> str:
