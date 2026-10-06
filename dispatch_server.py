@@ -318,6 +318,11 @@ async def list_tasks(
         ("created_before", created_before),
         ("completed_after", completed_after),
         ("completed_before", completed_before),
+        # assignee_id lives on the backend as of board-go PR with the
+        # ListTasks*Filtered SQL change. Client-side filtering against
+        # the response is broken because the list endpoint doesn't
+        # hydrate Assignees — the backend has to filter.
+        ("assignee_id", assignee),
     ):
         if val:
             params[key] = val
@@ -329,12 +334,11 @@ async def list_tasks(
     else:
         data = await _get(f"/projects/{project_id}/tasks", params)
     tasks = data.get("items", data) if isinstance(data, dict) else data
-    # status / assignee filters aren't supported by either backend handler;
-    # apply client-side so the MCP's advertised contract holds.
+    # status filter isn't supported by either backend handler yet; apply
+    # client-side so the MCP's advertised contract holds. assignee is
+    # now backend-filtered via assignee_id above.
     if status:
         tasks = [t for t in tasks if t.get("workflow_status") == status]
-    if assignee:
-        tasks = [t for t in tasks if t.get("assignee") == assignee]
     lines = []
     for t in tasks:
         flags = []
