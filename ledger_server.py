@@ -16,14 +16,16 @@ auto-refresh), revenue forecast (CRUD).
 
 from mcp.server.fastmcp import FastMCP
 
-from auth import make_auth_headers_fn
+from auth import make_auth_headers_fn, make_org_id_fn
 from ledger_tools import register_ledger_tools
 
 mcp = FastMCP("ledger")
 
 _auth_headers = make_auth_headers_fn(static_token_var="LEDGER_TOKEN")
+# upload_invoice needs the caller's org to send to ai-runner.
+_org_id = make_org_id_fn(_auth_headers)
 
-register_ledger_tools(mcp, _auth_headers)
+register_ledger_tools(mcp, _auth_headers, _org_id)
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

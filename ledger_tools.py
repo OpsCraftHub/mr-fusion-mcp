@@ -10,6 +10,7 @@ Design notes:
 - CSV import takes a local file_path; tool reads bytes and POSTs multipart.
 """
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Any
@@ -117,8 +118,13 @@ async def _resolve_contact_id(auth_headers: dict, contact_id: str = "", contact_
 # ── Tool registration ────────────────────────────────────────
 
 
-def register_ledger_tools(mcp, auth_headers_fn):
-    """Register Ledger (Vault) tools on the MCP server."""
+def register_ledger_tools(mcp, auth_headers_fn, org_id_fn=None):
+    """Register Ledger (Vault) tools on the MCP server.
+
+    org_id_fn is optional for backwards-compat with older callers;
+    tools that genuinely need the caller's org (upload_invoice)
+    raise if it wasn't wired.
+    """
 
     # ── Chart of accounts ────────────────────────────────────
 
@@ -1242,6 +1248,120 @@ def register_ledger_tools(mcp, auth_headers_fn):
                 raise Exception(f"AI Runner {r.status_code}: {detail}")
             out = r.json()
         return f"Retry {out.get('status')}: {out.get('summary')}"
+
+    @mcp.tool()
+    async def upload_invoice(
+        file_path: str,
+        org_id: str = "",
+        wait: bool = True,
+    ) -> str:
+        """Upload a supplier invoice (PDF/JPEG/PNG) and have the AI Runner
+        extract it and post a Vault ai_draft bill. Scanned PDFs and
+        phone-photo'd receipts work — raggamuffin OCR runs on anything
+        pypdf can't read.
+
+        Args:
+            file_path: Absolute path to a .pdf, .png, .jpg, or .jpeg file.
+            org_id: Target org UUID. Empty = decode from the current MCP
+                KC JWT (same behaviour as the workspace tools).
+            wait: True (default) → poll until the pipeline finishes
+                and return a human summary with bill_id. False → return
+                the job_id immediately; call get_invoice_upload_status
+                later.
+
+        Returns a human-readable status + bill_id (or job_id if wait=False).
+        """
+        p = Path(file_path).expanduser()
+        if not p.exists():
+            raise Exception(f"File not found: {file_path}")
+        if not p.is_file():
+            raise Exception(f"Not a file: {file_path}")
+        size = p.stat().st_size
+        if size == 0:
+            raise Exception(f"File is empty: {file_path}")
+        if size > 20 * 1024 * 1024:
+            raise Exception(f"File is {size // 1024 // 1024} MiB — raggamuffin caps at 20 MiB")
+
+        mime = {
+            ".pdf": "application/pdf",
+            ".png": "image/png",
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        }.get(p.suffix.lower())
+        if not mime:
+            raise Exception(f"Unsupported suffix {p.suffix!r} — need .pdf, .png, .jpg, or .jpeg")
+
+        if not org_id:
+            if org_id_fn is None:
+                raise Exception("org_id required (MCP server not wired with org_id_fn)")
+            org_id = await org_id_fn()
+
+        with p.open("rb") as fh:
+            file_bytes = fh.read()
+
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(
+                f"{AI_RUNNER_URL.rstrip('/')}/api/v1/watcher_invoice/upload",
+                files={"file": (p.name, file_bytes, mime)},
+                data={"org_id": org_id},
+                headers={"X-Internal-Service": "true"},
+            )
+            if not r.is_success:
+                try:
+                    detail = r.json()
+                except Exception:
+                    detail = r.text[:400]
+                raise Exception(f"AI Runner {r.status_code}: {detail}")
+            kickoff = r.json()
+
+        job_id = kickoff.get("job_id")
+        if not wait:
+            return f"Upload queued (job_id={job_id}). Call get_invoice_upload_status to check."
+
+        # Poll — raggamuffin OCR + LLM typically land under 30s;
+        # multi-page scans can go longer. 180s budget matches the
+        # watcher_invoice retry flow.
+        deadline_s = 180
+        poll_s = 2
+        waited = 0.0
+        async with httpx.AsyncClient(timeout=30) as c:
+            while waited < deadline_s:
+                await asyncio.sleep(poll_s)
+                waited += poll_s
+                s = await c.get(
+                    f"{AI_RUNNER_URL.rstrip('/')}/api/v1/watcher_invoice/upload/{job_id}",
+                    headers={"X-Internal-Service": "true"},
+                )
+                if s.status_code == 404:
+                    raise Exception(f"Job {job_id} disappeared (pod restart?)")
+                if not s.is_success:
+                    continue  # transient — keep polling
+                state = s.json()
+                if state.get("status") in ("success", "needs_review", "failed"):
+                    status = state["status"]
+                    summary = state.get("summary") or ""
+                    bill_id = state.get("bill_id")
+                    tail = f" · bill_id: {bill_id}" if bill_id else ""
+                    return f"[{status}] {summary}{tail}"
+        return f"Upload timed out after {deadline_s}s (job_id={job_id}). It may still complete — call get_invoice_upload_status."
+
+    @mcp.tool()
+    async def get_invoice_upload_status(job_id: str) -> str:
+        """Check the status of a prior upload_invoice(wait=False) call."""
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(
+                f"{AI_RUNNER_URL.rstrip('/')}/api/v1/watcher_invoice/upload/{job_id}",
+                headers={"X-Internal-Service": "true"},
+            )
+            if r.status_code == 404:
+                raise Exception(f"Unknown job_id {job_id}")
+            if not r.is_success:
+                raise Exception(f"AI Runner {r.status_code}: {r.text[:400]}")
+            state = r.json()
+        status = state.get("status")
+        summary = state.get("summary") or ""
+        bill_id = state.get("bill_id")
+        tail = f" · bill_id: {bill_id}" if bill_id else ""
+        return f"[{status}] {summary}{tail}"
 
     # ── Payments ──────────────────────────────────────────────
 
